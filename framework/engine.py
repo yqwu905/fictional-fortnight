@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any, Dict, Optional
@@ -17,6 +18,9 @@ from .losses import build_losses
 from .phase_runner import PhaseRunner
 from .distributed import init_distributed, barrier
 from .utils import StepTimer
+
+
+logger = logging.getLogger(__name__)
 
 
 def _plain(cfg):
@@ -240,7 +244,7 @@ class Trainer:
         )
 
         if self.dist_state.is_main_process:
-            print(
+            logger.info(
                 f"[runtime] distributed={self.dist_state.enabled}, "
                 f"strategy={self.dist_state.strategy}, "
                 f"backend={self.dist_state.backend}, "
@@ -248,7 +252,6 @@ class Trainer:
                 f"local_rank={self.dist_state.local_rank}, "
                 f"world_size={self.dist_state.world_size}, "
                 f"device={self.device}",
-                flush=True,
             )
 
         self.train_loader = build_dataloader(cfg.data.train, dist_state=self.dist_state)
@@ -338,13 +341,17 @@ class Trainer:
                         msg = f"step={self.global_step} " + " ".join(
                             f"{k}={v:.6g}" for k, v in scalar_metrics.items()
                         )
-                        print(msg, flush=True)
+                        logger.info(msg)
                 if (
                     self.profiling_enabled
                     and self.global_step % self.profiling_log_every == 0
                     and self.dist_state.is_main_process
                 ):
-                    print(f"\n[profile] step={self.global_step}\n{self.timer.format(multiline=True)}\n", flush=True)
+                    logger.info(
+                        "\n[profile] step=%s\n%s\n",
+                        self.global_step,
+                        self.timer.format(multiline=True),
+                    )
 
                 self.global_step += 1
                 if (
@@ -443,7 +450,7 @@ class Trainer:
                         os.path.join(sched_dir, f"{name}.pt"),
                     )
 
-        print(f"[checkpoint] saved to {ckpt_dir}", flush=True)
+        logger.info("[checkpoint] saved to %s", ckpt_dir)
 
     def cleanup_old_checkpoints(self, output_dir: str):
         if not self.dist_state.is_main_process:
@@ -477,7 +484,7 @@ class Trainer:
             step, path = ckpts.pop(0)
             import shutil
             shutil.rmtree(path, ignore_errors=True)
-            print(f"[checkpoint] removed old checkpoint: {path}", flush=True)
+            logger.info("[checkpoint] removed old checkpoint: %s", path)
 
     def log_tensorboard_images(self, ctx):
         if self.tb_writer is None:

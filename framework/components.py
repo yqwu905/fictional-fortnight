@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Dict, Iterable, Mapping, Optional
 import torch
 import torch.nn as nn
@@ -9,6 +10,9 @@ from omegaconf import DictConfig, OmegaConf
 from .instantiate import instantiate
 from .registry import get_selector
 from .distributed import DistState, wrap_ddp, unwrap_model
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -69,9 +73,11 @@ class ComponentManager:
             except Exception:
                 missing, unexpected = [], []
 
-        print(f"{name} load from {path}, result:")
-        print(f"\tMissing: {missing}")
-        print(f"\tUnexpected: {unexpected}")
+        logger.info("%s load from %s, result:", name, path)
+        log_missing = logger.warning if missing else logger.info
+        log_unexpected = logger.warning if unexpected else logger.info
+        log_missing("Missing: %s", missing)
+        log_unexpected("Unexpected: %s", unexpected)
 
     def apply_train_policy(self, module, train_cfg):
         if train_cfg is None:
@@ -311,7 +317,8 @@ class ComponentManager:
     def print_parameter_summary(self, component_names: Optional[Iterable[str]] = None):
         summaries = self.parameter_summary(component_names)
 
-        print("\n[component parameters]", flush=True)
+        logger.info("")
+        logger.info("[component parameters]")
 
         total_all = 0
         trainable_all = 0
@@ -325,7 +332,7 @@ class ComponentManager:
             total_all += total
             trainable_all += trainable
 
-            print(
+            logger.info(
                 f"  {name}: "
                 f"trainable={self._format_param_count(trainable)} "
                 f"({trainable:,}), "
@@ -334,13 +341,12 @@ class ComponentManager:
                 f"frozen={self._format_param_count(frozen)} "
                 f"({frozen:,}), "
                 f"ratio={ratio * 100:.4f}%",
-                flush=True,
             )
 
         frozen_all = total_all - trainable_all
         ratio_all = trainable_all / total_all if total_all > 0 else 0.0
 
-        print(
+        logger.info(
             f"  TOTAL: "
             f"trainable={self._format_param_count(trainable_all)} "
             f"({trainable_all:,}), "
@@ -349,5 +355,4 @@ class ComponentManager:
             f"frozen={self._format_param_count(frozen_all)} "
             f"({frozen_all:,}), "
             f"ratio={ratio_all * 100:.4f}%\n",
-            flush=True,
         )

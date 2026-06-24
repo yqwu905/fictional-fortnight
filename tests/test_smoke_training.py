@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 from framework.config import load_config
 from framework.context import TrainContext
 from framework.engine import Trainer, build_dataloader
+from framework.loggers import LoggerCollection, _normalize_backend_configs, to_log_images
 from framework.losses import build_losses
 from framework.components import ComponentManager
 from framework.phase_runner import PhaseRunner
@@ -82,6 +83,86 @@ class SmokeTrainingTest(unittest.TestCase):
             )
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
+
+    def test_logger_backend_configs_support_legacy_and_multi_backend_forms(self):
+        legacy = _normalize_backend_configs(
+            {
+                "tensorboard": {
+                    "enabled": True,
+                    "log_dir": "/tmp/tb",
+                }
+            }
+        )
+        self.assertEqual(legacy[0]["type"], "tensorboard")
+        self.assertTrue(legacy[0]["enabled"])
+
+        multi = _normalize_backend_configs(
+            {
+                "backends": {
+                    "tensorboard": {"enabled": True},
+                    "aim": {"enabled": False},
+                    "wandb": {"enabled": True, "project": "smoke"},
+                }
+            }
+        )
+        self.assertEqual([cfg["type"] for cfg in multi], ["tensorboard", "aim", "wandb"])
+        self.assertEqual(multi[2]["project"], "smoke")
+
+        shorthand = _normalize_backend_configs({"backends": ["tensorboard", "wandb"]})
+        self.assertEqual([cfg["type"] for cfg in shorthand], ["tensorboard", "wandb"])
+
+    def test_logger_collection_records_scalars_and_context_images(self):
+        class RecordingLogger:
+            def __init__(self):
+                self.metrics = []
+                self.images = []
+                self.flushed = False
+
+            def log_metrics(self, metrics, step):
+                self.metrics.append((step, dict(metrics)))
+
+            def log_images(self, tag, images, step):
+                self.images.append((step, tag, tuple(images.shape)))
+
+            def flush(self):
+                self.flushed = True
+
+            def close(self):
+                self.flush()
+
+        backend = RecordingLogger()
+        collection = LoggerCollection(
+            [backend],
+            image_cfg={
+                "enabled": True,
+                "every_n_steps": 2,
+                "max_images": 2,
+                "items": [
+                    {
+                        "tag": "image/input",
+                        "key": "batch.image",
+                        "value_range": "-1_1",
+                    }
+                ],
+            },
+        )
+        ctx = TrainContext()
+        ctx.set("batch.image", torch.zeros(3, 4, 5))
+
+        collection.log_metrics({"loss": 1.25}, step=1)
+        collection.log_images_from_context(ctx, step=1)
+        collection.log_images_from_context(ctx, step=2)
+        collection.flush()
+
+        self.assertEqual(backend.metrics, [(1, {"loss": 1.25})])
+        self.assertEqual(backend.images, [(2, "image/input", (1, 3, 4, 5))])
+        self.assertTrue(backend.flushed)
+
+    def test_to_log_images_handles_nhwc_and_value_ranges(self):
+        value = torch.full((2, 4, 5, 3), 255.0)
+        images = to_log_images(value, value_range="0_255", max_images=1)
+        self.assertEqual(tuple(images.shape), (1, 3, 4, 5))
+        self.assertTrue(torch.allclose(images, torch.ones_like(images)))
 
 
 if __name__ == "__main__":

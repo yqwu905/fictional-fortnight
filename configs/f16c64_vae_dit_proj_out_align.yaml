@@ -125,25 +125,34 @@ train_program:
 
 logging:
   reduce_metrics: true
-  tensorboard:
-    enabled: true
-    log_dir: null
-    images:
+  backends:
+    tensorboard:
       enabled: true
-      every_n_steps: 100
-      max_images: 4
-      items:
-        - tag: image/lq
-          key: batch.lq
-          value_range: "-1_1"
+      log_dir: null
+    aim:
+      enabled: false
+      repo: null
+      experiment: null
+    wandb:
+      enabled: false
+      project: null
+      name: null
+  images:
+    enabled: true
+    every_n_steps: 100
+    max_images: 4
+    items:
+      - tag: image/lq
+        key: batch.lq
+        value_range: "-1_1"
 
-        - tag: image/pred
-          key: pred.rgb
-          value_range: "-1_1"
+      - tag: image/pred
+        key: pred.rgb
+        value_range: "-1_1"
 
-        - tag: image/gt
-          key: batch.gt
-          value_range: "-1_1"
+      - tag: image/gt
+        key: batch.gt
+        value_range: "-1_1"
 
 profiling:
   enabled: false

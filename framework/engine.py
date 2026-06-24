@@ -18,6 +18,7 @@ from .losses import build_losses
 from .phase_runner import PhaseRunner
 from .distributed import init_distributed, barrier
 from .utils import StepTimer
+from .loggers import build_loggers
 
 
 logger = logging.getLogger(__name__)
@@ -25,87 +26,6 @@ logger = logging.getLogger(__name__)
 
 def _plain(cfg):
     return OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else cfg
-
-def _safe_ctx_get(ctx, key, default=None):
-    try:
-        return ctx.get(key, required=False)
-    except TypeError:
-        try:
-            return ctx.get(key)
-        except Exception:
-            return default
-    except Exception:
-        return default
-
-
-def _to_tensorboard_images(
-    value,
-    *,
-    value_range="auto",
-    max_images=4,
-):
-    if value is None:
-        return None
-
-    if isinstance(value, (list, tuple)):
-        value = [v for v in value if torch.is_tensor(v)]
-        if not value:
-            return None
-        value = torch.stack(value, dim=0)
-
-    if not torch.is_tensor(value):
-        return None
-
-    x = value.detach()
-
-    # [C, H, W] -> [1, C, H, W]
-    if x.ndim == 3:
-        x = x.unsqueeze(0)
-
-    # [H, W] -> [1, 1, H, W]
-    if x.ndim == 2:
-        x = x.unsqueeze(0).unsqueeze(0)
-
-    if x.ndim != 4:
-        return None
-
-    # 支持 NHWC -> NCHW
-    # 常见情况: [B, H, W, C]
-    if x.shape[1] not in {1, 3, 4} and x.shape[-1] in {1, 3, 4}:
-        x = x.permute(0, 3, 1, 2)
-
-    # 只显示前 max_images 张
-    x = x[: int(max_images)]
-
-    # 只显示前 3 个通道
-    if x.shape[1] > 3:
-        x = x[:, :3]
-
-    x = x.float().cpu()
-
-    value_range = str(value_range or "auto").lower()
-
-    if value_range in {"-1_1", "minus1_1", "neg1_1"}:
-        x = (x + 1.0) / 2.0
-    elif value_range in {"0_1", "01"}:
-        pass
-    elif value_range in {"0_255", "255"}:
-        x = x / 255.0
-    elif value_range == "auto":
-        xmin = float(x.min())
-        xmax = float(x.max())
-
-        if xmin < -0.05:
-            # 大概率是 [-1, 1]
-            x = (x + 1.0) / 2.0
-        elif xmax > 2.0:
-            # 大概率是 [0, 255]
-            x = x / 255.0
-    else:
-        raise ValueError(f"unsupported image value_range: {value_range}")
-
-    x = x.clamp(0.0, 1.0)
-    return x
 
 
 def move_to_device(obj, device):
@@ -140,28 +60,6 @@ def reduce_scalar_tensor(value: torch.Tensor, average: bool = True) -> torch.Ten
         return value
     return value
 
-
-def build_tensorboard_writer(logging_cfg, output_dir: str, is_main_process: bool):
-    logging_cfg = _plain(logging_cfg) or {}
-    tb_cfg = logging_cfg.get("tensorboard", {}) or {}
-
-    enabled = bool(tb_cfg.get("enabled", tb_cfg.get("enable", False)))
-    if not enabled or not is_main_process:
-        return None
-
-    try:
-        from torch.utils.tensorboard import SummaryWriter
-    except Exception as e:
-        raise ImportError(
-            "TensorBoard logging requires tensorboard. Install with: pip install tensorboard"
-        ) from e
-
-    log_dir = tb_cfg.get("log_dir")
-    if log_dir is None:
-        log_dir = os.path.join(output_dir, "tensorboard")
-
-    os.makedirs(log_dir, exist_ok=True)
-    return SummaryWriter(log_dir=log_dir)
 
 def build_dataloader(data_cfg, dist_state=None):
     data_cfg = _plain(data_cfg)
@@ -229,15 +127,8 @@ class Trainer:
         self.output_dir = experiment_cfg.get("output_dir", "outputs")
 
         logging_cfg = _plain(cfg.get("logging", {})) or {}
-        tb_cfg = _plain(logging_cfg.get("tensorboard", {})) or {}
-        tb_image_cfg = _plain(tb_cfg.get("images", {})) or {}
-        
-        self.tb_image_enabled = bool(tb_image_cfg.get("enabled", False))
-        self.tb_image_every_n_steps = int(tb_image_cfg.get("every_n_steps", 100) or 100)
-        self.tb_image_max_images = int(tb_image_cfg.get("max_images", 4) or 4)
-        self.tb_image_items = list(tb_image_cfg.get("items", []) or [])
         self.log_reduce = bool(logging_cfg.get("reduce_metrics", True))
-        self.tb_writer = build_tensorboard_writer(
+        self.loggers = build_loggers(
             logging_cfg=logging_cfg,
             output_dir=self.output_dir,
             is_main_process=self.dist_state.is_main_process,
@@ -309,9 +200,7 @@ class Trainer:
 
                 if self.global_step >= max_steps:
                     self.save_checkpoint(output_dir, tag="last")
-                    if self.tb_writer is not None:
-                        self.tb_writer.flush()
-                        self.tb_writer.close()
+                    self.loggers.close()
                     return
 
                 with self.timer.time("step/move_to_device"):
@@ -332,7 +221,8 @@ class Trainer:
                         metrics = self.phase_runner.run(ctx, phase_cfg)
                         all_metrics.update(metrics)
 
-                self.log_tensorboard_images(ctx)
+                if self.dist_state.is_main_process:
+                    self.loggers.log_images_from_context(ctx, self.global_step)
                 scalar_metrics = self.prepare_scalar_metrics(all_metrics)
                 if self.global_step % log_every == 0:
                     self.log_metrics(scalar_metrics)
@@ -363,9 +253,7 @@ class Trainer:
                 data_t0 = time.perf_counter()
 
         self.save_checkpoint(output_dir, tag="last")
-        if self.tb_writer is not None:
-            self.tb_writer.flush()
-            self.tb_writer.close()
+        self.loggers.close()
 
     def prepare_scalar_metrics(self, metrics: Dict[str, Any]) -> Dict[str, float]:
         scalar_metrics = {}
@@ -386,12 +274,8 @@ class Trainer:
         if not self.dist_state.is_main_process:
             return
 
-        if self.tb_writer is not None:
-            for key, value in metrics.items():
-                self.tb_writer.add_scalar(key, value, self.global_step)
-
-        if self.tb_writer is not None:
-            self.tb_writer.flush()
+        self.loggers.log_metrics(metrics, self.global_step)
+        self.loggers.flush()
 
     def save_checkpoint(self, output_dir: str, tag: str = "last"):
         if not self.dist_state.is_main_process:
@@ -485,41 +369,3 @@ class Trainer:
             import shutil
             shutil.rmtree(path, ignore_errors=True)
             logger.info("[checkpoint] removed old checkpoint: %s", path)
-
-    def log_tensorboard_images(self, ctx):
-        if self.tb_writer is None:
-            return
-
-        if not self.tb_image_enabled:
-            return
-
-        if not self.dist_state.is_main_process:
-            return
-
-        if self.global_step % self.tb_image_every_n_steps != 0:
-            return
-
-        for item in self.tb_image_items:
-            item = _plain(item)
-
-            tag = item["tag"]
-            key = item["key"]
-            value_range = item.get("value_range", "auto")
-            max_images = int(item.get("max_images", self.tb_image_max_images) or self.tb_image_max_images)
-
-            value = _safe_ctx_get(ctx, key, default=None)
-            images = _to_tensorboard_images(
-                value,
-                value_range=value_range,
-                max_images=max_images,
-            )
-
-            if images is None:
-                continue
-
-            self.tb_writer.add_images(
-                tag,
-                images,
-                global_step=self.global_step,
-                dataformats="NCHW",
-            )

@@ -118,9 +118,18 @@ train_program:
 
 logging:
   reduce_metrics: true
-  tensorboard:
-    enabled: true
-    log_dir: null
+  backends:
+    tensorboard:
+      enabled: true
+      log_dir: null
+    aim:
+      enabled: false
+      repo: null
+      experiment: null
+    wandb:
+      enabled: false
+      project: null
+      name: null
 
 profiling:
   enabled: false

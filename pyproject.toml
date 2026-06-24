@@ -24,6 +24,7 @@ dependencies = [
 
 [dependency-groups]
 npu = ["torch_npu", "decorator", "psutil", "scipy", "attrs"]
+logging = ["aim>=3.0.0", "wandb>=0.23.0"]
 
 [tool.uv]
 environments = [

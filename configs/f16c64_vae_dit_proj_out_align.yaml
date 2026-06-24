@@ -91,15 +91,13 @@ train_program:
       backward: true
       step: [dit_optim]
       ops:
-        - name: vae_encode
-          type: call
+        vae_encode:
           component: vae_encoder
           inputs:
             x: batch.lq
           outputs:
             latent: pred.latent
-        - name: text_encode
-          type: call
+        text_encode:
           component: offline_embedding
           method: get_embedding
           inputs:
@@ -109,16 +107,14 @@ train_program:
               value: pangu_1b_vl
           outputs:
             encoder_hidden_states: encoder_hidden_states
-        - name: dit
-          type: call
+        dit:
           component: dit
           inputs:
             hidden_states: pred.latent
             encoder_hidden_states: encoder_hidden_states
           outputs:
             out: pred.dit_out
-        - name: vae_decode
-          type: call
+        vae_decode:
           component: vae_decoder
           inputs:
             x: pred.dit_out

@@ -73,8 +73,7 @@ train_program:
       zero_grad:
         - main
       ops:
-        - type: call
-          name: forward_regressor
+        forward_regressor:
           component: regressor
           inputs:
             x: batch.input

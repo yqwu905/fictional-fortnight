@@ -89,29 +89,25 @@ train_program:
       step:
         - generator_optim
       ops:
-        - name: f16c64_vae_encode
-          type: call
+        f16c64_vae_encode:
           component: f16c64_vae_encoder
           inputs:
             x: batch.gt
           outputs:
             latent: new_vae_encoder.latent
-        - name: f16c32_vae_encode
-          type: call
+        f16c32_vae_encode:
           component: f16c32_vae_encoder
           inputs:
             x: batch.gt
           outputs:
             latent: old_vae_encoder.latent
-        - name: old_x_embedder
-          type: call
+        old_x_embedder:
           component: dit_old_x_embedder
           inputs:
             hidden_states: old_vae_encoder.latent
           outputs:
             out: old_x_embedder.out
-        - name: new_x_embedder
-          type: call
+        new_x_embedder:
           component: dit_new_x_embedder
           inputs:
             hidden_states: new_vae_encoder.latent

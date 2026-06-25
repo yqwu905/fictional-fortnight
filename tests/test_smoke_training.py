@@ -19,7 +19,7 @@ from framework.engine import Trainer, build_dataloader, _resolve_build_workers
 from framework.loggers import LoggerCollection, _normalize_backend_configs, to_log_images
 from framework.losses import build_losses
 from framework.ops.common import CallOp
-from framework.components import ComponentManager
+from framework.components import ComponentEntry, ComponentManager
 from framework.phase_runner import PhaseRunner
 from framework.optim import build_optimizers
 
@@ -265,6 +265,127 @@ class SmokeTrainingTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "matched no modules"):
             components.apply_parallel(dist_state, distributed_cfg={"fsdp": {}})
+
+    def _make_fsdp2_dist_state(self):
+        return DistState(
+            enabled=True,
+            strategy="fsdp2",
+            backend="gloo",
+            rank=0,
+            local_rank=0,
+            world_size=2,
+            device=torch.device("cpu"),
+            is_main_process=True,
+        )
+
+    def _register_fsdp_component(self, components, name, module, cfg=None):
+        components.entries[name] = ComponentEntry(
+            name=name,
+            module=module,
+            cfg=cfg or {"parallel": {"strategy": "fsdp2"}},
+            trainable_flags={},
+        )
+
+    def test_fsdp_wrap_modules_falls_back_to_module_method(self):
+        class WrapModuleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block_a = nn.Sequential(nn.Linear(4, 8), nn.Tanh())
+                self.block_b = nn.Sequential(nn.Linear(8, 4), nn.Tanh())
+                self.head = nn.Linear(4, 2)
+
+            def forward(self, x):
+                return self.head(self.block_b(self.block_a(x)))
+
+            def get_fsdp_wrap_module_list(self):
+                return [self.block_a, self.block_b]
+
+        components = ComponentManager({})
+        module = WrapModuleModel()
+        self._register_fsdp_component(components, "model", module)
+        dist_state = self._make_fsdp2_dist_state()
+
+        shard_calls = []
+
+        def fake_fully_shard(mod, _dist_state, _fsdp_cfg=None):
+            shard_calls.append(mod)
+            return mod
+
+        with patch("framework.components.fully_shard_module", side_effect=fake_fully_shard):
+            components.apply_parallel(dist_state, distributed_cfg={"fsdp": {}})
+
+        self.assertEqual(len(shard_calls), 3)
+        self.assertIs(shard_calls[0], module.block_a)
+        self.assertIs(shard_calls[1], module.block_b)
+        self.assertIs(shard_calls[2], module)
+
+    def test_fsdp_wrap_modules_config_takes_precedence_over_method(self):
+        class WrapModuleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block_a = nn.Sequential(nn.Linear(4, 8), nn.Tanh())
+                self.block_b = nn.Sequential(nn.Linear(8, 4), nn.Tanh())
+                self.head = nn.Linear(4, 2)
+
+            def forward(self, x):
+                return self.head(self.block_b(self.block_a(x)))
+
+            def get_fsdp_wrap_module_list(self):
+                raise AssertionError("get_fsdp_wrap_module_list should not be called")
+
+        components = ComponentManager({})
+        module = WrapModuleModel()
+        self._register_fsdp_component(
+            components,
+            "model",
+            module,
+            cfg={
+                "parallel": {"strategy": "fsdp2"},
+                "fsdp": {"wrap_modules": ["block_b"]},
+            },
+        )
+        dist_state = self._make_fsdp2_dist_state()
+
+        shard_calls = []
+
+        def fake_fully_shard(mod, _dist_state, _fsdp_cfg=None):
+            shard_calls.append(mod)
+            return mod
+
+        with patch("framework.components.fully_shard_module", side_effect=fake_fully_shard):
+            components.apply_parallel(dist_state, distributed_cfg={"fsdp": {}})
+
+        self.assertEqual(len(shard_calls), 2)
+        self.assertIs(shard_calls[0], module.block_b)
+        self.assertIs(shard_calls[1], module)
+
+    def test_fsdp_warns_when_no_wrap_modules_and_no_method(self):
+        class PlainModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block_a = nn.Sequential(nn.Linear(4, 8), nn.Tanh())
+
+            def forward(self, x):
+                return self.block_a(x)
+
+        components = ComponentManager({})
+        module = PlainModel()
+        self._register_fsdp_component(components, "model", module)
+        dist_state = self._make_fsdp2_dist_state()
+
+        shard_calls = []
+
+        def fake_fully_shard(mod, _dist_state, _fsdp_cfg=None):
+            shard_calls.append(mod)
+            return mod
+
+        with patch("framework.components.fully_shard_module", side_effect=fake_fully_shard):
+            with self.assertLogs("framework.components", level="WARNING") as cm:
+                components.apply_parallel(dist_state, distributed_cfg={"fsdp": {}})
+
+        self.assertEqual(len(shard_calls), 1)
+        self.assertIs(shard_calls[0], module)
+        self.assertTrue(any("get_fsdp_wrap_module_list" in msg for msg in cm.output))
 
     def test_build_all_parallel_runs_concurrently_and_preserves_order(self):
         from framework.instantiate import instantiate as real_instantiate

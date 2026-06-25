@@ -343,13 +343,24 @@ class ComponentManager:
             return
 
         wrap_patterns = list(fsdp_cfg.get("wrap_modules", []) or [])
-        wrapped_modules = self._resolve_fsdp_wrap_modules(
-            module,
-            wrap_patterns,
-            component_name=entry.name,
-        )
+        if wrap_patterns:
+            wrapped_modules = self._resolve_fsdp_wrap_modules(
+                module,
+                wrap_patterns,
+                component_name=entry.name,
+            )
+            wrap_submodules = [submodule for _, submodule in wrapped_modules]
+        else:
+            wrap_submodules = self._resolve_fsdp_wrap_modules_from_method(module)
+            if not wrap_submodules:
+                logger.warning(
+                    "component %s enabled fsdp2 but neither fsdp.wrap_modules nor "
+                    "get_fsdp_wrap_module_list() provided any wrap targets; "
+                    "only the top-level module will be sharded.",
+                    entry.name,
+                )
 
-        for _, submodule in wrapped_modules:
+        for submodule in wrap_submodules:
             fully_shard_module(submodule, dist_state, fsdp_cfg)
 
         sharded_module = fully_shard_module(module, dist_state, fsdp_cfg)
@@ -396,6 +407,34 @@ class ComponentManager:
             deduped[name] = submodule
 
         return sorted(deduped.items(), key=lambda item: item[0].count("."), reverse=True)
+
+    @staticmethod
+    def _resolve_fsdp_wrap_modules_from_method(module: nn.Module):
+        getter = getattr(module, "get_fsdp_wrap_module_list", None)
+        if not callable(getter):
+            return []
+
+        returned = getter()
+        if not returned:
+            return []
+
+        name_by_id = {id(sub): name for name, sub in module.named_modules() if name}
+
+        seen = set()
+        keyed = []
+        for sub in returned:
+            if not isinstance(sub, nn.Module) or sub is module:
+                continue
+            sid = id(sub)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            name = name_by_id.get(sid, "")
+            depth = name.count(".") if name else -1
+            keyed.append((depth, sub))
+
+        keyed.sort(key=lambda item: item[0], reverse=True)
+        return [sub for _, sub in keyed]
 
     @staticmethod
     def _broadcast_module_state(module: nn.Module):

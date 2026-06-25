@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import fnmatch
 import logging
@@ -37,8 +38,12 @@ class ComponentManager:
         self.cfg = OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else dict(cfg or {})
         self.entries: Dict[str, ComponentEntry] = {}
 
-    def build_all(self):
-        for name, c in self.cfg.items():
+    def build_all(self, max_workers: Optional[int] = None):
+        items = list(self.cfg.items())
+        if not items:
+            return self
+
+        def _build_one(name, c):
             module = instantiate(c)
 
             ckpt = c.get("checkpoint")
@@ -48,12 +53,44 @@ class ComponentManager:
             module = self.apply_train_policy(module, c.get("train", {"strategy": "full"}))
             trainable_flags = self._snapshot_trainable_flags(module)
 
-            self.entries[name] = ComponentEntry(
+            return ComponentEntry(
                 name=name,
                 module=module,
                 cfg=c,
                 trainable_flags=trainable_flags,
             )
+
+        if not max_workers or max_workers <= 1 or len(items) <= 1:
+            for name, c in items:
+                self.entries[name] = _build_one(name, c)
+            return self
+
+        worker_count = max(1, min(int(max_workers), len(items)))
+        results: Dict[str, ComponentEntry] = {}
+        first_exc: Optional[BaseException] = None
+
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="comp-build",
+        ) as ex:
+            future_to_name = {
+                ex.submit(_build_one, name, c): name for name, c in items
+            }
+            for fut in as_completed(future_to_name):
+                try:
+                    entry = fut.result()
+                    results[entry.name] = entry
+                except BaseException as exc:
+                    if first_exc is None:
+                        first_exc = exc
+
+        if first_exc is not None:
+            raise first_exc
+
+        for name, _ in items:
+            if name not in results:
+                raise RuntimeError(f"component {name!r} was not built")
+            self.entries[name] = results[name]
 
         return self
 

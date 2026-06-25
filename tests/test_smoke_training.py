@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 
 import torch
+import torch.nn as nn
 from omegaconf import OmegaConf
 
 from framework.config import load_config
 from framework.context import TrainContext
+from framework.distributed import DistState
 from framework.engine import Trainer, build_dataloader
 from framework.loggers import LoggerCollection, _normalize_backend_configs, to_log_images
 from framework.losses import build_losses
+from framework.ops.common import CallOp
 from framework.components import ComponentManager
 from framework.phase_runner import PhaseRunner
 from framework.optim import build_optimizers
@@ -163,6 +167,171 @@ class SmokeTrainingTest(unittest.TestCase):
         images = to_log_images(value, value_range="0_255", max_images=1)
         self.assertEqual(tuple(images.shape), (1, 3, 4, 5))
         self.assertTrue(torch.allclose(images, torch.ones_like(images)))
+
+    def test_component_parallel_strategy_defaults_for_fsdp2(self):
+        cfg = OmegaConf.create(
+            {
+                "trainable": {
+                    "target": "test_assets.models.TinyRegressor",
+                    "train": {"strategy": "full"},
+                },
+                "frozen": {
+                    "target": "test_assets.models.TinyRegressor",
+                    "train": {"strategy": "frozen"},
+                },
+                "explicit_fsdp": {
+                    "target": "test_assets.models.TinyRegressor",
+                    "train": {"strategy": "full"},
+                    "parallel": {"strategy": "fsdp2"},
+                },
+                "legacy_fsdp_enabled": {
+                    "target": "test_assets.models.TinyRegressor",
+                    "train": {"strategy": "full"},
+                    "fsdp": {"enabled": True},
+                },
+            }
+        )
+        components = ComponentManager(cfg).build_all()
+        fsdp_cfg = {"default_non_fsdp_trainable": "ddp"}
+
+        self.assertEqual(
+            components.resolve_parallel_strategy(components.entries["trainable"], fsdp_cfg),
+            "ddp",
+        )
+        self.assertEqual(
+            components.resolve_parallel_strategy(components.entries["frozen"], fsdp_cfg),
+            "replicated",
+        )
+        self.assertEqual(
+            components.resolve_parallel_strategy(components.entries["explicit_fsdp"], fsdp_cfg),
+            "fsdp2",
+        )
+        self.assertEqual(
+            components.resolve_parallel_strategy(
+                components.entries["legacy_fsdp_enabled"],
+                fsdp_cfg,
+            ),
+            "fsdp2",
+        )
+
+    def test_trainable_replicated_component_requires_explicit_opt_in(self):
+        cfg = OmegaConf.create(
+            {
+                "bad": {
+                    "target": "test_assets.models.TinyRegressor",
+                    "train": {"strategy": "full"},
+                    "parallel": {"strategy": "replicated"},
+                }
+            }
+        )
+        components = ComponentManager(cfg).build_all()
+        dist_state = DistState(
+            enabled=True,
+            strategy="fsdp2",
+            backend="gloo",
+            rank=0,
+            local_rank=0,
+            world_size=2,
+            device=torch.device("cpu"),
+            is_main_process=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "trainable parameters"):
+            components.apply_parallel(dist_state, distributed_cfg={"fsdp": {}})
+
+    def test_fsdp_wrap_modules_reports_missing_paths(self):
+        cfg = OmegaConf.create(
+            {
+                "model": {
+                    "target": "test_assets.models.TinyRegressor",
+                    "parallel": {"strategy": "fsdp2"},
+                    "fsdp": {"wrap_modules": ["missing.*"]},
+                }
+            }
+        )
+        components = ComponentManager(cfg).build_all()
+        dist_state = DistState(
+            enabled=True,
+            strategy="fsdp2",
+            backend="gloo",
+            rank=0,
+            local_rank=0,
+            world_size=2,
+            device=torch.device("cpu"),
+            is_main_process=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "matched no modules"):
+            components.apply_parallel(dist_state, distributed_cfg={"fsdp": {}})
+
+    def test_call_op_default_forward_invokes_module_call_hooks(self):
+        class HookedModule(nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        module = HookedModule()
+        called = {"pre": False}
+        module.register_forward_pre_hook(lambda *_: called.__setitem__("pre", True))
+
+        class Components:
+            def __getitem__(self, name):
+                assert name == "model"
+                return module
+
+        ctx = TrainContext()
+        ctx.set("x", torch.tensor(1.0))
+        op = CallOp(
+            {
+                "component": "model",
+                "inputs": {"x": "x"},
+                "outputs": {"_": "y"},
+            }
+        )
+
+        op(ctx, Components())
+
+        self.assertTrue(called["pre"])
+        self.assertEqual(float(ctx.get("y")), 2.0)
+
+    @unittest.skipUnless(
+        os.environ.get("RUN_FSDP2_TORCHRUN_SMOKE") == "1",
+        "set RUN_FSDP2_TORCHRUN_SMOKE=1 to run the two-process FSDP2 smoke test",
+    )
+    def test_torchrun_mixed_fsdp2_smoke(self):
+        torchrun = shutil.which("torchrun")
+        if torchrun is None:
+            self.skipTest("torchrun is not available")
+
+        output_dir = tempfile.mkdtemp(prefix="fictional-fortnight-fsdp2-test-")
+        try:
+            cmd = [
+                torchrun,
+                "--standalone",
+                "--nproc_per_node=2",
+                "-m",
+                "framework.train",
+                "--config",
+                "configs/test/tiny_mixed_fsdp2.yaml",
+                f"experiment.output_dir={output_dir}",
+            ]
+            result = subprocess.run(
+                cmd,
+                cwd=os.getcwd(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertTrue(os.path.exists(os.path.join(output_dir, "checkpoint-last")))
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(output_dir, "checkpoint-last", "models", "fsdp_model.pt")
+                )
+            )
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

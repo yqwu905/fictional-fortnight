@@ -5,6 +5,7 @@ import os
 import time
 from typing import Any, Dict, Optional
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from omegaconf import DictConfig, OmegaConf
@@ -16,7 +17,7 @@ from .components import ComponentManager
 from .optim import build_optimizers, build_schedulers
 from .losses import build_losses
 from .phase_runner import PhaseRunner
-from .distributed import init_distributed, barrier
+from .distributed import init_distributed, barrier, is_fsdp2_module, unwrap_model
 from .utils import StepTimer
 from .loggers import build_loggers
 
@@ -114,6 +115,12 @@ class Trainer:
         self.keep_last = int(self.keep_last) if self.keep_last not in (None, 0, "0") else None
         self.save_optimizer_state = bool(checkpoint_cfg.get("save_optimizer", True))
         self.save_scheduler_state = bool(checkpoint_cfg.get("save_scheduler", True))
+        distributed_cfg = dict(runtime_cfg.get("distributed", {}) or {})
+        fsdp_cfg = dict(distributed_cfg.get("fsdp", {}) or {})
+        fsdp_checkpoint_cfg = dict(fsdp_cfg.get("checkpoint", {}) or {})
+        self.fsdp_checkpoint_format = str(
+            fsdp_checkpoint_cfg.get("format", "full_rank0")
+        ).lower()
 
         self.timer = StepTimer(
             enabled=self.profiling_enabled,
@@ -148,11 +155,11 @@ class Trainer:
         self.train_loader = build_dataloader(cfg.data.train, dist_state=self.dist_state)
 
         self.components = ComponentManager(cfg.get("components", cfg.get("models", {}))).build_all()
-        self.components.to(self.device)
+        self.components.apply_parallel(
+            self.dist_state,
+            distributed_cfg=distributed_cfg,
+        )
         self.components.set_initial_modes()
-
-        ddp_cfg = dict((runtime_cfg.get("distributed", {}) or {}).get("ddp", {}) or {})
-        self.components.wrap_ddp(self.dist_state, ddp_cfg=ddp_cfg)
 
         if self.dist_state.is_main_process:
             self.components.print_parameter_summary()
@@ -278,6 +285,10 @@ class Trainer:
         self.loggers.flush()
 
     def save_checkpoint(self, output_dir: str, tag: str = "last"):
+        if self.dist_state.strategy == "fsdp2":
+            self.save_fsdp2_checkpoint(output_dir, tag=tag)
+            return
+
         if not self.dist_state.is_main_process:
             return
 
@@ -335,6 +346,188 @@ class Trainer:
                     )
 
         logger.info("[checkpoint] saved to %s", ckpt_dir)
+
+    def save_fsdp2_checkpoint(self, output_dir: str, tag: str = "last"):
+        if self.fsdp_checkpoint_format == "dcp_sharded":
+            self.save_fsdp2_dcp_checkpoint(output_dir, tag=tag)
+            return
+
+        if self.fsdp_checkpoint_format != "full_rank0":
+            raise ValueError(
+                f"unsupported FSDP2 checkpoint format: {self.fsdp_checkpoint_format}"
+            )
+
+        ckpt_dir = os.path.join(output_dir, f"checkpoint-{tag}")
+        if self.dist_state.is_main_process:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            OmegaConf.save(self.cfg, os.path.join(ckpt_dir, "config.yaml"))
+            torch.save(
+                {
+                    "global_step": self.global_step,
+                    "world_size": self.dist_state.world_size,
+                },
+                os.path.join(ckpt_dir, "trainer_state.pt"),
+            )
+            os.makedirs(os.path.join(ckpt_dir, "models"), exist_ok=True)
+            if self.save_optimizer_state:
+                os.makedirs(os.path.join(ckpt_dir, "optimizers"), exist_ok=True)
+            if self.save_scheduler_state:
+                os.makedirs(os.path.join(ckpt_dir, "schedulers"), exist_ok=True)
+
+        if self.dist_state.enabled:
+            barrier()
+
+        model_options, get_model_state_dict, get_optimizer_state_dict = (
+            self._fsdp_full_state_dict_helpers()
+        )
+        models_dir = os.path.join(ckpt_dir, "models")
+
+        for name, entry in self.components.entries.items():
+            module = unwrap_model(entry.module)
+            if not hasattr(module, "state_dict"):
+                continue
+
+            save_policy = entry.cfg.get("save", "full")
+            if save_policy == "none":
+                continue
+
+            if is_fsdp2_module(module):
+                if save_policy == "lora_only":
+                    raise NotImplementedError(
+                        "FSDP2 checkpointing does not support save: lora_only yet"
+                    )
+                state_dict = get_model_state_dict(module, options=model_options)
+                if self.dist_state.is_main_process:
+                    torch.save(state_dict, os.path.join(models_dir, f"{name}.pt"))
+                continue
+
+            if not self.dist_state.is_main_process:
+                continue
+
+            if save_policy == "lora_only" and hasattr(module, "save_pretrained"):
+                module.save_pretrained(os.path.join(models_dir, f"{name}_lora"))
+            else:
+                torch.save(
+                    self._cpu_state_dict(module.state_dict()),
+                    os.path.join(models_dir, f"{name}.pt"),
+                )
+
+        if self.save_optimizer_state:
+            bundle = self._component_state_bundle()
+            optim_dir = os.path.join(ckpt_dir, "optimizers")
+
+            for name, optimizer in self.optimizers.items():
+                state_dict = get_optimizer_state_dict(
+                    bundle,
+                    optimizer,
+                    options=model_options,
+                )
+                if self.dist_state.is_main_process:
+                    torch.save(state_dict, os.path.join(optim_dir, f"{name}.pt"))
+
+        if self.save_scheduler_state and self.dist_state.is_main_process:
+            sched_dir = os.path.join(ckpt_dir, "schedulers")
+            for name, scheduler in self.schedulers.items():
+                if hasattr(scheduler, "state_dict"):
+                    torch.save(
+                        scheduler.state_dict(),
+                        os.path.join(sched_dir, f"{name}.pt"),
+                    )
+
+        if self.dist_state.enabled:
+            barrier()
+
+        if self.dist_state.is_main_process:
+            logger.info("[checkpoint] saved to %s", ckpt_dir)
+
+    def save_fsdp2_dcp_checkpoint(self, output_dir: str, tag: str = "last"):
+        ckpt_dir = os.path.join(output_dir, f"checkpoint-{tag}")
+        dcp_dir = os.path.join(ckpt_dir, "dcp")
+        os.makedirs(dcp_dir, exist_ok=True)
+
+        if self.dist_state.is_main_process:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            OmegaConf.save(self.cfg, os.path.join(ckpt_dir, "config.yaml"))
+
+        state: Dict[str, Any] = {
+            "trainer_state": {
+                "global_step": self.global_step,
+                "world_size": self.dist_state.world_size,
+            },
+            "models": {},
+        }
+
+        for name, entry in self.components.entries.items():
+            module = unwrap_model(entry.module)
+            if not hasattr(module, "state_dict"):
+                continue
+            if entry.cfg.get("save", "full") == "none":
+                continue
+            if entry.cfg.get("save", "full") == "lora_only" and is_fsdp2_module(module):
+                raise NotImplementedError(
+                    "FSDP2 dcp_sharded checkpointing does not support save: lora_only yet"
+                )
+            state["models"][name] = module.state_dict()
+
+        if self.save_optimizer_state:
+            state["optimizers"] = {
+                name: optimizer.state_dict()
+                for name, optimizer in self.optimizers.items()
+            }
+
+        if self.save_scheduler_state:
+            state["schedulers"] = {
+                name: scheduler.state_dict()
+                for name, scheduler in self.schedulers.items()
+                if hasattr(scheduler, "state_dict")
+            }
+
+        try:
+            import torch.distributed.checkpoint as dcp
+        except Exception as e:
+            raise ImportError("FSDP2 dcp_sharded checkpointing requires torch.distributed.checkpoint") from e
+
+        dcp.save(state, checkpoint_id=dcp_dir)
+
+        if self.dist_state.enabled:
+            barrier()
+
+        if self.dist_state.is_main_process:
+            logger.info("[checkpoint] saved to %s", ckpt_dir)
+
+    @staticmethod
+    def _fsdp_full_state_dict_helpers():
+        try:
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_model_state_dict,
+                get_optimizer_state_dict,
+            )
+        except Exception as e:
+            raise ImportError(
+                "FSDP2 full checkpointing requires torch.distributed.checkpoint.state_dict"
+            ) from e
+
+        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        return options, get_model_state_dict, get_optimizer_state_dict
+
+    def _component_state_bundle(self) -> nn.Module:
+        bundle = nn.Module()
+        for name, entry in self.components.entries.items():
+            module = unwrap_model(entry.module)
+            if isinstance(module, nn.Module):
+                bundle.add_module(name, module)
+        return bundle
+
+    @staticmethod
+    def _cpu_state_dict(state_dict):
+        cpu_state = {}
+        for key, value in state_dict.items():
+            if torch.is_tensor(value):
+                cpu_state[key] = value.detach().cpu()
+            else:
+                cpu_state[key] = value
+        return cpu_state
 
     def cleanup_old_checkpoints(self, output_dir: str):
         if not self.dist_state.is_main_process:

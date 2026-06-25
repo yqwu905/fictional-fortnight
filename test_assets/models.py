@@ -27,6 +27,24 @@ class TinyRegressor(nn.Module):
         }
 
 
+class WrappedRegressor(nn.Module):
+    def __init__(
+        self,
+        input_dim: int = 4,
+        hidden_dim: int = 8,
+        output_dim: int = 2,
+    ):
+        super().__init__()
+        self.model = TinyRegressor(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+        )
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self.model(x)
+
+
 class CheckpointedRegressor(nn.Module):
     def __init__(
         self,

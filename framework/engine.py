@@ -13,7 +13,7 @@ import torch.distributed as torch_dist
 
 from .context import TrainContext
 from .instantiate import instantiate
-from .components import ComponentManager
+from .components import ComponentManager, resolve_submodule
 from .optim import build_optimizers, build_schedulers
 from .losses import build_losses
 from .phase_runner import PhaseRunner
@@ -331,9 +331,14 @@ class Trainer:
             if not hasattr(module, "state_dict"):
                 continue
 
-            save_policy = self.components.entries[name].cfg.get("save", "full")
+            entry = self.components.entries[name]
+            save_policy = entry.cfg.get("save", "full")
             if save_policy == "none":
                 continue
+
+            save_submodule = entry.cfg.get("save_submodule")
+            if save_submodule:
+                module = resolve_submodule(module, save_submodule)
 
             if save_policy == "lora_only" and hasattr(module, "save_pretrained"):
                 module.save_pretrained(os.path.join(models_dir, f"{name}_lora"))
@@ -410,6 +415,10 @@ class Trainer:
             if save_policy == "none":
                 continue
 
+            save_submodule = entry.cfg.get("save_submodule")
+            if save_submodule:
+                module = resolve_submodule(module, save_submodule)
+
             if is_fsdp2_module(module):
                 if save_policy == "lora_only":
                     raise NotImplementedError(
@@ -419,6 +428,14 @@ class Trainer:
                 if self.dist_state.is_main_process:
                     torch.save(state_dict, os.path.join(models_dir, f"{name}.pt"))
                 continue
+
+            if save_submodule and is_fsdp2_module(unwrap_model(entry.module)):
+                raise ValueError(
+                    f"component {name} save_submodule {save_submodule!r} is not an "
+                    f"FSDPModule; add it to fsdp.wrap_modules so it gets sharded, "
+                    f"otherwise the saved checkpoint would contain DTensor shards "
+                    f"instead of a full state dict."
+                )
 
             if not self.dist_state.is_main_process:
                 continue
@@ -482,6 +499,11 @@ class Trainer:
                 continue
             if entry.cfg.get("save", "full") == "none":
                 continue
+
+            save_submodule = entry.cfg.get("save_submodule")
+            if save_submodule:
+                module = resolve_submodule(module, save_submodule)
+
             if entry.cfg.get("save", "full") == "lora_only" and is_fsdp2_module(module):
                 raise NotImplementedError(
                     "FSDP2 dcp_sharded checkpointing does not support save: lora_only yet"

@@ -24,6 +24,13 @@ from .distributed import (
 logger = logging.getLogger(__name__)
 
 
+def resolve_submodule(module, path: str):
+    obj = module
+    for part in str(path).split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
 @dataclass
 class ComponentEntry:
     name: str
@@ -49,7 +56,13 @@ class ComponentManager:
 
             ckpt = c.get("checkpoint")
             if ckpt:
-                self.load_checkpoint(module, ckpt, name, strict=c.get("strict", True))
+                self.load_checkpoint(
+                    module,
+                    ckpt,
+                    name,
+                    strict=c.get("strict", True),
+                    save_submodule=c.get("save_submodule"),
+                )
 
             module = self.apply_train_policy(module, c.get("train", {"strategy": "full"}))
             trainable_flags = self._snapshot_trainable_flags(module)
@@ -100,16 +113,33 @@ class ComponentManager:
             return {}
         return {name: p.requires_grad for name, p in module.named_parameters()}
 
-    def load_checkpoint(self, module, path: str, name: str, strict: bool = True):
+    def load_checkpoint(
+        self,
+        module,
+        path: str,
+        name: str,
+        strict: bool = True,
+        save_submodule: Optional[str] = None,
+    ):
         state = torch.load(path, map_location="cpu")
 
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
 
-        if not hasattr(module, "load_state_dict"):
-            raise TypeError(f"component {module} has no load_state_dict")
+        target = module
+        if save_submodule:
+            try:
+                target = resolve_submodule(module, save_submodule)
+            except AttributeError as e:
+                raise AttributeError(
+                    f"component {name} save_submodule {save_submodule!r} could not be "
+                    f"resolved on {type(module).__name__}: {e}"
+                ) from e
 
-        result = module.load_state_dict(state, strict=strict)
+        if not hasattr(target, "load_state_dict"):
+            raise TypeError(f"component {target} has no load_state_dict")
+
+        result = target.load_state_dict(state, strict=strict)
 
         missing = getattr(result, "missing_keys", None)
         unexpected = getattr(result, "unexpected_keys", None)

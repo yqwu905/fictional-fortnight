@@ -22,7 +22,7 @@ from framework.ops.common import CallOp
 from framework.components import ComponentEntry, ComponentManager
 from framework.phase_runner import PhaseRunner
 from framework.optim import build_optimizers
-from test_assets.models import CheckpointedRegressor, TinyRegressor
+from test_assets.models import CheckpointedRegressor, TinyRegressor, WrappedRegressor
 
 
 class SmokeTrainingTest(unittest.TestCase):
@@ -689,6 +689,121 @@ class SmokeTrainingTest(unittest.TestCase):
                     os.path.join(output_dir, "checkpoint-last", "models", "fsdp_model.pt")
                 )
             )
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    def test_save_submodule_strips_wrapper_prefix_and_round_trips(self):
+        cfg = load_config("configs/test/tiny_save_submodule.yaml")
+        output_dir = tempfile.mkdtemp(prefix="fictional-fortnight-save-submodule-")
+        try:
+            cfg = OmegaConf.merge(cfg, {"experiment": {"output_dir": output_dir}})
+            trainer = Trainer(cfg)
+            trainer.train()
+
+            ckpt_path = os.path.join(
+                output_dir, "checkpoint-last", "models", "regressor.pt"
+            )
+            self.assertTrue(os.path.exists(ckpt_path))
+
+            state = torch.load(ckpt_path, map_location="cpu")
+
+            expected_keys = set(TinyRegressor().state_dict().keys())
+            self.assertEqual(set(state.keys()), expected_keys)
+            self.assertFalse(
+                any(k.startswith("model.") for k in state.keys()),
+                f"save_submodule should strip wrapper prefix, got keys: {list(state.keys())}",
+            )
+
+            wrapper = WrappedRegressor(input_dim=4, hidden_dim=8, output_dim=2)
+            result = wrapper.model.load_state_dict(state, strict=True)
+            self.assertEqual(getattr(result, "missing_keys", []), [])
+            self.assertEqual(getattr(result, "unexpected_keys", []), [])
+
+            for name, param in wrapper.model.named_parameters():
+                self.assertTrue(
+                    torch.equal(param, state[name]),
+                    f"round-trip mismatch for {name}",
+                )
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    def test_save_submodule_loads_into_inner_module(self):
+        import tempfile as _tempfile
+
+        ckpt_path = _tempfile.mktemp(suffix=".pt")
+        try:
+            torch.manual_seed(31)
+            src = WrappedRegressor(input_dim=4, hidden_dim=8, output_dim=2)
+            torch.save(src.model.state_dict(), ckpt_path)
+
+            cfg = OmegaConf.create(
+                {
+                    "wrapper": {
+                        "target": "test_assets.models.WrappedRegressor",
+                        "params": {
+                            "input_dim": 4,
+                            "hidden_dim": 8,
+                            "output_dim": 2,
+                        },
+                        "checkpoint": ckpt_path,
+                        "save_submodule": "model",
+                        "strict": True,
+                    }
+                }
+            )
+            components = ComponentManager(cfg).build_all()
+            loaded = components.unwrap("wrapper")
+
+            for name, param in src.model.named_parameters():
+                self.assertTrue(
+                    torch.equal(param, dict(loaded.model.named_parameters())[name]),
+                    f"load_checkpoint save_submodule mismatch for {name}",
+                )
+        finally:
+            if os.path.exists(ckpt_path):
+                os.remove(ckpt_path)
+
+    @unittest.skipUnless(
+        os.environ.get("RUN_FSDP2_TORCHRUN_SMOKE") == "1",
+        "set RUN_FSDP2_TORCHRUN_SMOKE=1 to run the two-process FSDP2 smoke test",
+    )
+    def test_torchrun_save_submodule_fsdp2_smoke(self):
+        torchrun = shutil.which("torchrun")
+        if torchrun is None:
+            self.skipTest("torchrun is not available")
+
+        output_dir = tempfile.mkdtemp(prefix="fictional-fortnight-save-submodule-fsdp2-")
+        try:
+            cmd = [
+                torchrun,
+                "--standalone",
+                "--nproc_per_node=2",
+                "-m",
+                "framework.train",
+                "--config",
+                "configs/test/tiny_save_submodule_fsdp2.yaml",
+                f"experiment.output_dir={output_dir}",
+            ]
+            result = subprocess.run(
+                cmd,
+                cwd=os.getcwd(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+
+            ckpt_path = os.path.join(
+                output_dir, "checkpoint-last", "models", "fsdp_model.pt"
+            )
+            self.assertTrue(os.path.exists(ckpt_path))
+
+            state = torch.load(ckpt_path, map_location="cpu")
+            expected_keys = set(TinyRegressor().state_dict().keys())
+            self.assertEqual(set(state.keys()), expected_keys)
+            self.assertFalse(any(k.startswith("model.") for k in state.keys()))
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 

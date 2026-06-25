@@ -4,7 +4,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -13,7 +15,7 @@ from omegaconf import OmegaConf
 from framework.config import load_config
 from framework.context import TrainContext
 from framework.distributed import DistState
-from framework.engine import Trainer, build_dataloader
+from framework.engine import Trainer, build_dataloader, _resolve_build_workers
 from framework.loggers import LoggerCollection, _normalize_backend_configs, to_log_images
 from framework.losses import build_losses
 from framework.ops.common import CallOp
@@ -263,6 +265,81 @@ class SmokeTrainingTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "matched no modules"):
             components.apply_parallel(dist_state, distributed_cfg={"fsdp": {}})
+
+    def test_build_all_parallel_runs_concurrently_and_preserves_order(self):
+        from framework.instantiate import instantiate as real_instantiate
+
+        cfg = OmegaConf.create(
+            {
+                f"comp{i}": {"target": "test_assets.models.TinyRegressor"}
+                for i in range(4)
+            }
+        )
+        sleep_seconds = 0.3
+
+        def slow_instantiate(c, **kw):
+            time.sleep(sleep_seconds)
+            return real_instantiate(c, **kw)
+
+        with patch("framework.components.instantiate", side_effect=slow_instantiate):
+            t0 = time.perf_counter()
+            components = ComponentManager(cfg).build_all(max_workers=4)
+            elapsed = time.perf_counter() - t0
+
+        self.assertLess(elapsed, sleep_seconds * 2.5)
+        self.assertEqual(
+            list(components.entries.keys()),
+            [f"comp{i}" for i in range(4)],
+        )
+
+    def test_build_all_serial_when_max_workers_le_one(self):
+        from framework.instantiate import instantiate as real_instantiate
+
+        cfg = OmegaConf.create(
+            {
+                f"comp{i}": {"target": "test_assets.models.TinyRegressor"}
+                for i in range(4)
+            }
+        )
+        sleep_seconds = 0.2
+
+        def slow_instantiate(c, **kw):
+            time.sleep(sleep_seconds)
+            return real_instantiate(c, **kw)
+
+        with patch("framework.components.instantiate", side_effect=slow_instantiate):
+            t0 = time.perf_counter()
+            components = ComponentManager(cfg).build_all(max_workers=1)
+            elapsed = time.perf_counter() - t0
+
+        self.assertGreaterEqual(elapsed, sleep_seconds * 3.5)
+        self.assertEqual(
+            list(components.entries.keys()),
+            [f"comp{i}" for i in range(4)],
+        )
+
+    def test_build_all_parallel_propagates_first_exception(self):
+        cfg = OmegaConf.create(
+            {
+                "good": {"target": "test_assets.models.TinyRegressor"},
+                "bad": {"target": "test_assets.models.NoSuchClass"},
+            }
+        )
+
+        with self.assertRaises((AttributeError, ModuleNotFoundError)):
+            ComponentManager(cfg).build_all(max_workers=2)
+
+    def test_resolve_build_workers_accepts_common_falsey_values(self):
+        self.assertIsNone(_resolve_build_workers(None))
+        self.assertIsNone(_resolve_build_workers(False))
+        self.assertIsNone(_resolve_build_workers(0))
+        self.assertIsNone(_resolve_build_workers(1))
+        self.assertIsNone(_resolve_build_workers(""))
+        self.assertIsNone(_resolve_build_workers("0"))
+        self.assertIsNone(_resolve_build_workers("false"))
+        self.assertIsNone(_resolve_build_workers("none"))
+        self.assertEqual(_resolve_build_workers(4), 4)
+        self.assertEqual(_resolve_build_workers("4"), 4)
 
     def test_call_op_default_forward_invokes_module_call_hooks(self):
         class HookedModule(nn.Module):

@@ -29,6 +29,20 @@ def _plain(cfg):
     return OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else cfg
 
 
+def _resolve_build_workers(value) -> Optional[int]:
+    if value is None or value is False:
+        return None
+
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("", "0", "false", "none", "null"):
+            return None
+        value = int(s)
+
+    value = int(value)
+    return value if value > 1 else None
+
+
 def move_to_device(obj, device):
     if torch.is_tensor(obj):
         return obj.to(device, non_blocking=True)
@@ -154,7 +168,11 @@ class Trainer:
 
         self.train_loader = build_dataloader(cfg.data.train, dist_state=self.dist_state)
 
-        self.components = ComponentManager(cfg.get("components", cfg.get("models", {}))).build_all()
+        build_cfg = _plain(runtime_cfg.get("build", {})) or {}
+        max_workers = _resolve_build_workers(build_cfg.get("parallel_build_components"))
+        self.components = ComponentManager(
+            cfg.get("components", cfg.get("models", {}))
+        ).build_all(max_workers=max_workers)
         self.components.apply_parallel(
             self.dist_state,
             distributed_cfg=distributed_cfg,

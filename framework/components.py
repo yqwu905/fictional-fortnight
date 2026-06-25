@@ -31,6 +31,7 @@ class ComponentEntry:
     cfg: Mapping[str, Any]
     trainable_flags: Dict[str, bool]
     parallel_strategy: str = "none"
+    gradient_checkpointing: bool = False
 
 
 class ComponentManager:
@@ -180,6 +181,79 @@ class ComponentManager:
         )
 
         return get_peft_model(module, lora_cfg)
+
+    _GC_METHOD_CANDIDATES = (
+        "gradient_checkpointing_enable",
+        "enable_gradient_checkpointing",
+    )
+
+    def apply_gradient_checkpointing(self):
+        for name, entry in self.entries.items():
+            gc_cfg = entry.cfg.get("gradient_checkpointing")
+            if not gc_cfg:
+                continue
+
+            module = entry.module
+            if not isinstance(module, nn.Module):
+                logger.warning(
+                    "component %s has gradient_checkpointing configured but is not an nn.Module; skipping",
+                    name,
+                )
+                continue
+
+            enabled, method_name, method_kwargs = self._resolve_gc_cfg(gc_cfg)
+            if not enabled:
+                continue
+
+            self._enable_gc_on_module(name, module, method_name, method_kwargs)
+            entry.gradient_checkpointing = True
+
+        return self
+
+    @staticmethod
+    def _resolve_gc_cfg(gc_cfg):
+        if isinstance(gc_cfg, bool):
+            return gc_cfg, None, {}
+
+        gc_cfg = dict(gc_cfg)
+        enabled = bool(gc_cfg.get("enabled", True))
+        method_name = gc_cfg.get("method")
+        method_kwargs = dict(gc_cfg.get("method_kwargs", {}) or {})
+        return enabled, method_name, method_kwargs
+
+    @staticmethod
+    def _enable_gc_on_module(name, module, method_name, method_kwargs):
+        if method_name is not None:
+            fn = getattr(module, method_name, None)
+            if not callable(fn):
+                raise ValueError(
+                    f"component {name} gradient_checkpointing.method "
+                    f"{method_name!r} not found on {type(module).__name__}"
+                )
+            fn(**method_kwargs)
+            logger.info(
+                "[component %s] gradient checkpointing enabled via %s",
+                name,
+                method_name,
+            )
+            return
+
+        for candidate in ComponentManager._GC_METHOD_CANDIDATES:
+            fn = getattr(module, candidate, None)
+            if callable(fn):
+                fn(**method_kwargs)
+                logger.info(
+                    "[component %s] gradient checkpointing enabled via %s",
+                    name,
+                    candidate,
+                )
+                return
+
+        raise ValueError(
+            f"component {name} has gradient_checkpointing enabled but implements none of "
+            f"{list(ComponentManager._GC_METHOD_CANDIDATES)}; implement one or set "
+            f"gradient_checkpointing.method explicitly"
+        )
 
     def to(self, device):
         for entry in self.entries.values():

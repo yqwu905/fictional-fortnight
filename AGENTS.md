@@ -43,6 +43,7 @@ components:
       strategy: full
     mode: train
     save: full
+    gradient_checkpointing: true
 ```
 
 约定：
@@ -52,6 +53,7 @@ components:
 - `mode` 支持 `train`、`eval`，只控制初始模式；phase 内的 `modes` 可覆盖。
 - `save` 支持 `full`、`none`，LoRA 模块可使用 `lora_only`。
 - checkpoint 可以是裸 `state_dict`，也可以是包含 `state_dict` key 的 dict。
+- `gradient_checkpointing` 可按组件独立开启，用于节省显存。支持 `true` 简写或 `{ enabled, method, method_kwargs }` 完整形式。默认自动探测模块的 `gradient_checkpointing_enable` / `enable_gradient_checkpointing` 方法并无参调用（走库默认值）；需要自定义时用 `method` 指定方法名、`method_kwargs` 透传参数。在 DDP/FSDP2 包装前启用，FSDP2 下建议保持 `use_reentrant=false`。未实现该方法会报错。
 
 配置复用：
 

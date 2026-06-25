@@ -22,6 +22,7 @@ from framework.ops.common import CallOp
 from framework.components import ComponentEntry, ComponentManager
 from framework.phase_runner import PhaseRunner
 from framework.optim import build_optimizers
+from test_assets.models import CheckpointedRegressor, TinyRegressor
 
 
 class SmokeTrainingTest(unittest.TestCase):
@@ -490,6 +491,166 @@ class SmokeTrainingTest(unittest.TestCase):
 
         self.assertTrue(called["pre"])
         self.assertEqual(float(ctx.get("y")), 2.0)
+
+    def test_gradient_checkpointing_bool_shorthand_enables_via_auto_detect(self):
+        components = ComponentManager({})
+        module = CheckpointedRegressor()
+        components.entries["m"] = ComponentEntry(
+            name="m",
+            module=module,
+            cfg={"gradient_checkpointing": True},
+            trainable_flags={},
+        )
+
+        components.apply_gradient_checkpointing()
+
+        self.assertTrue(components.entries["m"].gradient_checkpointing)
+        self.assertTrue(module.use_gc)
+        self.assertEqual(module.gc_method_calls[0][0], "gradient_checkpointing_enable")
+
+    def test_gradient_checkpointing_dict_form_passes_method_and_kwargs(self):
+        components = ComponentManager({})
+        module = CheckpointedRegressor()
+        components.entries["m"] = ComponentEntry(
+            name="m",
+            module=module,
+            cfg={
+                "gradient_checkpointing": {
+                    "enabled": True,
+                    "method": "enable_gradient_checkpointing",
+                    "method_kwargs": {"use_reentrant": False},
+                }
+            },
+            trainable_flags={},
+        )
+
+        components.apply_gradient_checkpointing()
+
+        self.assertTrue(components.entries["m"].gradient_checkpointing)
+        self.assertTrue(module.use_gc)
+        self.assertEqual(module.gc_method_calls[0][0], "enable_gradient_checkpointing")
+        self.assertEqual(module.gc_method_calls[0][1], {"use_reentrant": False})
+
+    def test_gradient_checkpointing_falsy_values_are_noop(self):
+        components = ComponentManager({})
+        off_module = CheckpointedRegressor()
+        components.entries["off"] = ComponentEntry(
+            name="off",
+            module=off_module,
+            cfg={"gradient_checkpointing": False},
+            trainable_flags={},
+        )
+        missing_module = CheckpointedRegressor()
+        components.entries["missing"] = ComponentEntry(
+            name="missing",
+            module=missing_module,
+            cfg={},
+            trainable_flags={},
+        )
+        disabled_module = CheckpointedRegressor()
+        components.entries["disabled"] = ComponentEntry(
+            name="disabled",
+            module=disabled_module,
+            cfg={"gradient_checkpointing": {"enabled": False}},
+            trainable_flags={},
+        )
+
+        components.apply_gradient_checkpointing()
+
+        self.assertFalse(components.entries["off"].gradient_checkpointing)
+        self.assertFalse(components.entries["missing"].gradient_checkpointing)
+        self.assertFalse(components.entries["disabled"].gradient_checkpointing)
+        self.assertFalse(off_module.use_gc)
+        self.assertFalse(missing_module.use_gc)
+        self.assertFalse(disabled_module.use_gc)
+
+    def test_gradient_checkpointing_missing_method_raises(self):
+        components = ComponentManager({})
+        components.entries["m"] = ComponentEntry(
+            name="m",
+            module=TinyRegressor(),
+            cfg={"gradient_checkpointing": True},
+            trainable_flags={},
+        )
+
+        with self.assertRaisesRegex(ValueError, "gradient_checkpointing_enable"):
+            components.apply_gradient_checkpointing()
+
+    def test_gradient_checkpointing_explicit_method_missing_raises(self):
+        components = ComponentManager({})
+        components.entries["m"] = ComponentEntry(
+            name="m",
+            module=CheckpointedRegressor(),
+            cfg={
+                "gradient_checkpointing": {
+                    "enabled": True,
+                    "method": "nonexistent_method",
+                }
+            },
+            trainable_flags={},
+        )
+
+        with self.assertRaisesRegex(ValueError, "nonexistent_method"):
+            components.apply_gradient_checkpointing()
+
+    def test_gradient_checkpointing_non_module_warns_and_skips(self):
+        class NonModule:
+            pass
+
+        components = ComponentManager({})
+        components.entries["m"] = ComponentEntry(
+            name="m",
+            module=NonModule(),
+            cfg={"gradient_checkpointing": True},
+            trainable_flags={},
+        )
+
+        with self.assertLogs("framework.components", level="WARNING") as cm:
+            components.apply_gradient_checkpointing()
+
+        self.assertFalse(components.entries["m"].gradient_checkpointing)
+        self.assertTrue(any("not an nn.Module" in msg for msg in cm.output))
+
+    def test_gradient_checkpointing_integration_via_phase_runner(self):
+        torch.manual_seed(11)
+        cfg = load_config("configs/test/tiny_gradient_checkpointing.yaml")
+        batch = next(iter(build_dataloader(cfg.data.train)))
+        ctx = TrainContext(global_step=0, batch=batch)
+
+        components = ComponentManager(cfg.components).build_all()
+        components.apply_gradient_checkpointing()
+
+        regressor = components.unwrap("regressor")
+        self.assertTrue(regressor.use_gc)
+        self.assertTrue(components.entries["regressor"].gradient_checkpointing)
+
+        optimizers = build_optimizers(cfg.optimizers, components)
+        losses = build_losses(cfg.losses)
+        runner = PhaseRunner(
+            components,
+            optimizers,
+            schedulers={},
+            losses=losses,
+            device=torch.device("cpu"),
+        )
+
+        before = {
+            name: param.detach().clone()
+            for name, param in regressor.named_parameters()
+        }
+        metrics = runner.run(ctx, cfg.train_program.phases[0])
+        after = dict(regressor.named_parameters())
+
+        self.assertIn("mse/loss", metrics)
+        self.assertIn("regression/total_loss", metrics)
+        self.assertTrue(
+            any(p.grad is not None for p in regressor.parameters()),
+            "expected gradients to flow through gradient checkpointing",
+        )
+        self.assertTrue(
+            any(not torch.equal(before[name], after[name]) for name in before),
+            "expected at least one model parameter to change",
+        )
 
     @unittest.skipUnless(
         os.environ.get("RUN_FSDP2_TORCHRUN_SMOKE") == "1",

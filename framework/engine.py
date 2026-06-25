@@ -173,6 +173,7 @@ class Trainer:
         self.components = ComponentManager(
             cfg.get("components", cfg.get("models", {}))
         ).build_all(max_workers=max_workers)
+        self.components.apply_gradient_checkpointing()
         self.components.apply_parallel(
             self.dist_state,
             distributed_cfg=distributed_cfg,

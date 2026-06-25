@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 import torch
 from omegaconf import DictConfig, OmegaConf
 
@@ -21,6 +21,30 @@ def _metric_to_float(value):
     if isinstance(value, (int, float)):
         return float(value)
     return value
+
+
+def _iter_ops(ops_cfg):
+    ops_cfg = _plain(ops_cfg) or []
+
+    if isinstance(ops_cfg, Mapping):
+        if "type" in ops_cfg:
+            raise ValueError(
+                "phase ops should be a list or a mapping of op_name -> op config; "
+                "got a single op mapping with a top-level 'type'"
+            )
+
+        for op_name, op_cfg in ops_cfg.items():
+            op_cfg = dict(op_cfg or {})
+            op_cfg.setdefault("name", op_name)
+            op_cfg.setdefault("type", "call")
+            yield op_cfg
+        return
+
+    for op_cfg in ops_cfg:
+        op_cfg = dict(op_cfg or {})
+        op_cfg.setdefault("type", "call")
+        op_cfg.setdefault("name", op_cfg["type"])
+        yield op_cfg
 
 
 def _autocast_context(device, mixed_precision: str):
@@ -90,8 +114,7 @@ class PhaseRunner:
 
             with self._time(f"phase/{name}/forward_and_loss"):
                 with _autocast_context(self.device, self.mixed_precision):
-                    for op_cfg in phase_cfg.get("ops", []) or []:
-                        op_cfg = _plain(op_cfg)
+                    for op_cfg in _iter_ops(phase_cfg.get("ops", [])):
                         op_type = op_cfg["type"]
                         op_name = op_cfg.get("name", op_type)
                         component_name = op_cfg.get("component")

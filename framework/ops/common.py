@@ -50,7 +50,7 @@ class CallOp:
 
         if component_name is not None:
             obj = components[component_name]
-            fn = getattr(obj, method_name)
+            fn = obj if method_name == "forward" else getattr(obj, method_name)
         else:
             fn = locate(self.cfg["function"])
 

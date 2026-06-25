@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fnmatch
+import logging
 from typing import Any, Dict, Iterable, Mapping, Optional
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
 from .instantiate import instantiate
 from .registry import get_selector
-from .distributed import DistState, wrap_ddp, unwrap_model
+from .distributed import (
+    DistState,
+    fully_shard_module,
+    register_fsdp2_forward_methods,
+    unwrap_model,
+    wrap_ddp,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -17,6 +29,7 @@ class ComponentEntry:
     module: Any
     cfg: Mapping[str, Any]
     trainable_flags: Dict[str, bool]
+    parallel_strategy: str = "none"
 
 
 class ComponentManager:
@@ -69,9 +82,11 @@ class ComponentManager:
             except Exception:
                 missing, unexpected = [], []
 
-        print(f"{name} load from {path}, result:")
-        print(f"\tMissing: {missing}")
-        print(f"\tUnexpected: {unexpected}")
+        logger.info("%s load from %s, result:", name, path)
+        log_missing = logger.warning if missing else logger.info
+        log_unexpected = logger.warning if unexpected else logger.info
+        log_missing("Missing: %s", missing)
+        log_unexpected("Unexpected: %s", unexpected)
 
     def apply_train_policy(self, module, train_cfg):
         if train_cfg is None:
@@ -135,20 +150,73 @@ class ComponentManager:
                 entry.module.to(device)
         return self
 
-    def wrap_ddp(self, dist_state: DistState, ddp_cfg=None):
+    def apply_parallel(
+        self,
+        dist_state: DistState,
+        distributed_cfg: Optional[Mapping[str, Any]] = None,
+    ):
+        distributed_cfg = dict(distributed_cfg or {})
+
         if not dist_state.enabled:
+            self.to(dist_state.device)
             return self
 
-        ddp_cfg = dict(ddp_cfg or {})
+        if dist_state.strategy == "ddp":
+            self.to(dist_state.device)
+            self._apply_ddp_parallel(dist_state, dict(distributed_cfg.get("ddp", {}) or {}))
+            return self
+
+        if dist_state.strategy != "fsdp2":
+            raise ValueError(f"unsupported distributed strategy: {dist_state.strategy}")
+
+        fsdp_global_cfg = dict(distributed_cfg.get("fsdp", {}) or {})
+        ddp_global_cfg = dict(distributed_cfg.get("ddp", {}) or {})
 
         for name, entry in self.entries.items():
             module = entry.module
 
             if not isinstance(module, nn.Module):
+                entry.parallel_strategy = "none"
                 continue
 
-            has_trainable = any(p.requires_grad for p in module.parameters())
+            strategy = self.resolve_parallel_strategy(entry, fsdp_global_cfg)
+            entry.parallel_strategy = strategy
+
+            if strategy == "fsdp2":
+                fsdp_cfg = dict(fsdp_global_cfg)
+                fsdp_cfg.update(dict(entry.cfg.get("fsdp", {}) or {}))
+                self._apply_fsdp2_to_entry(entry, dist_state, fsdp_cfg)
+            elif strategy == "ddp":
+                module.to(dist_state.device)
+                component_ddp_cfg = dict(ddp_global_cfg)
+                component_ddp_cfg.update(dict(entry.cfg.get("ddp", {}) or {}))
+                entry.module = wrap_ddp(
+                    module,
+                    dist_state=dist_state,
+                    ddp_cfg=component_ddp_cfg,
+                )
+            elif strategy == "replicated":
+                self._validate_replicated_entry(entry)
+                module.to(dist_state.device)
+                self._broadcast_module_state(module)
+            elif strategy == "none":
+                module.to(dist_state.device)
+            else:
+                raise ValueError(f"unsupported parallel strategy for {name}: {strategy}")
+
+        return self
+
+    def _apply_ddp_parallel(self, dist_state: DistState, ddp_cfg: Mapping[str, Any]):
+        for name, entry in self.entries.items():
+            module = entry.module
+
+            if not isinstance(module, nn.Module):
+                entry.parallel_strategy = "none"
+                continue
+
+            has_trainable = self._has_trainable_params(module)
             if not has_trainable:
+                entry.parallel_strategy = "replicated"
                 continue
 
             component_ddp_cfg = dict(ddp_cfg)
@@ -159,8 +227,146 @@ class ComponentManager:
                 dist_state=dist_state,
                 ddp_cfg=component_ddp_cfg,
             )
+            entry.parallel_strategy = "ddp"
 
         return self
+
+    def wrap_ddp(self, dist_state: DistState, ddp_cfg=None):
+        distributed_cfg = {"ddp": dict(ddp_cfg or {})}
+        return self.apply_parallel(dist_state, distributed_cfg=distributed_cfg)
+
+    def resolve_parallel_strategy(
+        self,
+        entry: ComponentEntry,
+        fsdp_global_cfg: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        fsdp_global_cfg = dict(fsdp_global_cfg or {})
+        parallel_cfg = dict(entry.cfg.get("parallel", {}) or {})
+        explicit = parallel_cfg.get("strategy")
+
+        if explicit is not None:
+            return self._normalize_parallel_strategy(explicit)
+
+        fsdp_cfg = dict(entry.cfg.get("fsdp", {}) or {})
+        if bool(fsdp_cfg.get("enabled", False)):
+            return "fsdp2"
+
+        if self._has_trainable_params(entry.module):
+            default_strategy = fsdp_global_cfg.get("default_non_fsdp_trainable", "ddp")
+            return self._normalize_parallel_strategy(default_strategy)
+
+        return "replicated"
+
+    @staticmethod
+    def _normalize_parallel_strategy(value) -> str:
+        strategy = str(value).lower().replace("-", "_")
+        aliases = {
+            "fsdp": "fsdp2",
+            "fsdp2": "fsdp2",
+            "fully_sharded": "fsdp2",
+            "ddp": "ddp",
+            "distributed_data_parallel": "ddp",
+            "replica": "replicated",
+            "replicated": "replicated",
+            "none": "replicated",
+        }
+        if strategy not in aliases:
+            raise ValueError(f"unsupported component parallel strategy: {value!r}")
+        return aliases[strategy]
+
+    @staticmethod
+    def _has_trainable_params(module) -> bool:
+        if not hasattr(module, "parameters"):
+            return False
+        return any(p.requires_grad for p in module.parameters())
+
+    def _validate_replicated_entry(self, entry: ComponentEntry):
+        if self._has_trainable_params(entry.module):
+            allow = bool(
+                dict(entry.cfg.get("parallel", {}) or {}).get(
+                    "allow_trainable_replicated",
+                    False,
+                )
+            )
+            if not allow:
+                raise ValueError(
+                    f"component {entry.name} uses replicated parallel strategy "
+                    "but still has trainable parameters; use ddp/fsdp2 or set "
+                    "parallel.allow_trainable_replicated=true explicitly"
+                )
+
+    def _apply_fsdp2_to_entry(
+        self,
+        entry: ComponentEntry,
+        dist_state: DistState,
+        fsdp_cfg: Mapping[str, Any],
+    ):
+        module = entry.module
+        if not isinstance(module, nn.Module):
+            return
+
+        wrap_patterns = list(fsdp_cfg.get("wrap_modules", []) or [])
+        wrapped_modules = self._resolve_fsdp_wrap_modules(
+            module,
+            wrap_patterns,
+            component_name=entry.name,
+        )
+
+        for _, submodule in wrapped_modules:
+            fully_shard_module(submodule, dist_state, fsdp_cfg)
+
+        sharded_module = fully_shard_module(module, dist_state, fsdp_cfg)
+        entry.module = module if sharded_module is None else sharded_module
+        register_fsdp2_forward_methods(
+            entry.module,
+            fsdp_cfg.get("forward_methods", []) or [],
+        )
+
+    @staticmethod
+    def _resolve_fsdp_wrap_modules(
+        module: nn.Module,
+        patterns: Iterable[str],
+        *,
+        component_name: str,
+    ):
+        patterns = list(patterns or [])
+        if not patterns:
+            return []
+
+        named_modules = [(name, submodule) for name, submodule in module.named_modules() if name]
+        selected = []
+        missing = []
+
+        for pattern in patterns:
+            matches = [
+                item
+                for item in named_modules
+                if fnmatch.fnmatchcase(item[0], str(pattern))
+            ]
+            if not matches:
+                missing.append(str(pattern))
+            selected.extend(matches)
+
+        if missing:
+            available = ", ".join(name for name, _ in named_modules[:20])
+            raise ValueError(
+                f"component {component_name} fsdp.wrap_modules matched no modules: "
+                f"{missing}. Available module paths include: {available}"
+            )
+
+        deduped = {}
+        for name, submodule in selected:
+            deduped[name] = submodule
+
+        return sorted(deduped.items(), key=lambda item: item[0].count("."), reverse=True)
+
+    @staticmethod
+    def _broadcast_module_state(module: nn.Module):
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            dist.broadcast(tensor.detach(), src=0)
 
     def set_phase_state(self, trainable=None, frozen=None, modes=None):
         trainable = set(trainable or [])
@@ -311,7 +517,8 @@ class ComponentManager:
     def print_parameter_summary(self, component_names: Optional[Iterable[str]] = None):
         summaries = self.parameter_summary(component_names)
 
-        print("\n[component parameters]", flush=True)
+        logger.info("")
+        logger.info("[component parameters]")
 
         total_all = 0
         trainable_all = 0
@@ -325,7 +532,7 @@ class ComponentManager:
             total_all += total
             trainable_all += trainable
 
-            print(
+            logger.info(
                 f"  {name}: "
                 f"trainable={self._format_param_count(trainable)} "
                 f"({trainable:,}), "
@@ -334,13 +541,12 @@ class ComponentManager:
                 f"frozen={self._format_param_count(frozen)} "
                 f"({frozen:,}), "
                 f"ratio={ratio * 100:.4f}%",
-                flush=True,
             )
 
         frozen_all = total_all - trainable_all
         ratio_all = trainable_all / total_all if total_all > 0 else 0.0
 
-        print(
+        logger.info(
             f"  TOTAL: "
             f"trainable={self._format_param_count(trainable_all)} "
             f"({trainable_all:,}), "
@@ -349,5 +555,4 @@ class ComponentManager:
             f"frozen={self._format_param_count(frozen_all)} "
             f"({frozen_all:,}), "
             f"ratio={ratio_all * 100:.4f}%\n",
-            flush=True,
         )

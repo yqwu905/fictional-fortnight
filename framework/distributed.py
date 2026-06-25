@@ -25,6 +25,7 @@ class DistState:
     world_size: int
     device: torch.device
     is_main_process: bool
+    device_mesh: Any = None
 
 
 def _has_npu() -> bool:
@@ -88,15 +89,15 @@ def init_distributed(runtime_cfg: Optional[Mapping[str, Any]] = None) -> DistSta
             is_main_process=True,
         )
 
-    if strategy != "ddp":
+    if strategy not in {"ddp", "fsdp2"}:
         raise ValueError(f"unsupported distributed strategy: {strategy}")
 
     required_envs = ["RANK", "LOCAL_RANK", "WORLD_SIZE"]
     missing = [k for k in required_envs if k not in os.environ]
     if missing:
         raise RuntimeError(
-            f"DDP requires torchrun, missing envs: {missing}. "
-            f"Launch with: torchrun --nproc_per_node=... -m aitrain.train --config xxx.yaml"
+            f"{strategy} requires torchrun, missing envs: {missing}. "
+            f"Launch with: torchrun --nproc_per_node=... -m framework.train --config xxx.yaml"
         )
 
     rank = int(os.environ["RANK"])
@@ -104,6 +105,9 @@ def init_distributed(runtime_cfg: Optional[Mapping[str, Any]] = None) -> DistSta
     world_size = int(os.environ["WORLD_SIZE"])
 
     device_type = _infer_device_type(device_cfg)
+    if strategy == "fsdp2" and device_type == "npu":
+        raise ValueError("FSDP2 is not supported for NPU in this framework yet")
+
     if device_type == "cpu":
         device = torch.device("cpu")
     else:
@@ -121,15 +125,20 @@ def init_distributed(runtime_cfg: Optional[Mapping[str, Any]] = None) -> DistSta
             world_size=world_size,
         )
 
+    device_mesh = None
+    if strategy == "fsdp2":
+        device_mesh = _init_device_mesh(device_type, world_size)
+
     return DistState(
         enabled=True,
-        strategy="ddp",
+        strategy=strategy,
         backend=backend,
         rank=rank,
         local_rank=local_rank,
         world_size=world_size,
         device=device,
         is_main_process=(rank == 0),
+        device_mesh=device_mesh,
     )
 
 
@@ -177,6 +186,114 @@ def wrap_ddp(module: Any, dist_state: DistState, ddp_cfg: Optional[Mapping[str, 
         broadcast_buffers=bool(ddp_cfg.get("broadcast_buffers", True)),
         static_graph=bool(ddp_cfg.get("static_graph", False)),
     )
+
+
+def _init_device_mesh(device_type: str, world_size: int):
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+    except Exception as e:
+        raise ImportError("FSDP2 requires torch.distributed.device_mesh.init_device_mesh") from e
+
+    return init_device_mesh(
+        device_type,
+        (world_size,),
+        mesh_dim_names=("dp",),
+    )
+
+
+def _parse_dtype(value):
+    if value in (None, "none", "null", "false", False):
+        return None
+    if isinstance(value, torch.dtype):
+        return value
+
+    key = str(value).lower().replace("torch.", "")
+    aliases = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "float": torch.float32,
+    }
+    if key not in aliases:
+        raise ValueError(f"unsupported FSDP dtype: {value!r}")
+    return aliases[key]
+
+
+def build_fsdp2_kwargs(
+    dist_state: DistState,
+    fsdp_cfg: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    fsdp_cfg = dict(fsdp_cfg or {})
+    kwargs: dict[str, Any] = {"mesh": dist_state.device_mesh}
+
+    if "reshard_after_forward" in fsdp_cfg:
+        kwargs["reshard_after_forward"] = fsdp_cfg["reshard_after_forward"]
+
+    mp_cfg = dict(fsdp_cfg.get("mixed_precision", {}) or {})
+    if bool(mp_cfg.get("enabled", False)):
+        try:
+            from torch.distributed.fsdp import MixedPrecisionPolicy
+        except Exception as e:
+            raise ImportError("FSDP2 mixed precision requires torch.distributed.fsdp") from e
+
+        kwargs["mp_policy"] = MixedPrecisionPolicy(
+            param_dtype=_parse_dtype(mp_cfg.get("param_dtype")),
+            reduce_dtype=_parse_dtype(mp_cfg.get("reduce_dtype")),
+            output_dtype=_parse_dtype(mp_cfg.get("output_dtype")),
+            cast_forward_inputs=bool(mp_cfg.get("cast_forward_inputs", True)),
+        )
+
+    offload_cfg = dict(fsdp_cfg.get("cpu_offload", {}) or {})
+    if bool(offload_cfg.get("enabled", False)):
+        try:
+            from torch.distributed.fsdp import CPUOffloadPolicy
+        except Exception as e:
+            raise ImportError("FSDP2 CPU offload requires torch.distributed.fsdp") from e
+
+        kwargs["offload_policy"] = CPUOffloadPolicy(
+            pin_memory=bool(offload_cfg.get("pin_memory", True)),
+        )
+
+    return kwargs
+
+
+def fully_shard_module(
+    module: nn.Module,
+    dist_state: DistState,
+    fsdp_cfg: Optional[Mapping[str, Any]] = None,
+):
+    try:
+        from torch.distributed.fsdp import fully_shard
+    except Exception as e:
+        raise ImportError("FSDP2 requires torch.distributed.fsdp.fully_shard") from e
+
+    return fully_shard(module, **build_fsdp2_kwargs(dist_state, fsdp_cfg))
+
+
+def is_fsdp2_module(module) -> bool:
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except Exception:
+        return False
+    return isinstance(module, FSDPModule)
+
+
+def register_fsdp2_forward_methods(module, method_names):
+    method_names = list(method_names or [])
+    if not method_names:
+        return
+
+    try:
+        from torch.distributed.fsdp import register_fsdp_forward_method
+    except Exception as e:
+        raise ImportError("FSDP2 custom forward methods require register_fsdp_forward_method") from e
+
+    for method_name in method_names:
+        register_fsdp_forward_method(module, str(method_name))
 
 
 def reduce_scalar(value, op: str = "mean"):

@@ -10,3 +10,6 @@ wheels/
 .venv
 .opencode
 output
+
+# Codemap tool local state
+.slim

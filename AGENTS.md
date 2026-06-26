@@ -294,3 +294,14 @@ PYTHONPYCACHEPREFIX=/tmp/fictional-fortnight-pycache python3 -m compileall -q fr
 
 - 示例配置中 `configs/f16c64_vae_dit_proj_out_align.yaml` 和 `configs/f16c64_vae_x_embbder_align.yaml` 的部分 import 目标不存在于当前仓库。
 - `framework/ops/common.py` 的 `save_image` op 当前引用了未在文件中定义或导入的 `save_image`、`_ensure_list`、`_basename_without_ext`。使用该 op 前需要补齐实现或导入。
+
+## Repository Map
+
+A full codemap is available at `codemap.md` in the project root.
+
+Before working on any task, read `codemap.md` to understand:
+- Project architecture and entry points
+- Directory responsibilities and design patterns
+- Data flow and integration points between modules
+
+For deep work on a specific folder, also read that folder's `codemap.md`.

@@ -19,6 +19,7 @@ from framework.engine import Trainer, build_dataloader, _resolve_build_workers
 from framework.loggers import LoggerCollection, _normalize_backend_configs, to_log_images
 from framework.losses import build_losses
 from framework.ops.common import CallOp
+from framework.registry import get_op
 from framework.components import ComponentEntry, ComponentManager
 from framework.phase_runner import PhaseRunner
 from framework.optim import build_optimizers
@@ -170,6 +171,81 @@ class SmokeTrainingTest(unittest.TestCase):
         images = to_log_images(value, value_range="0_255", max_images=1)
         self.assertEqual(tuple(images.shape), (1, 3, 4, 5))
         self.assertTrue(torch.allclose(images, torch.ones_like(images)))
+
+    def test_nch_ldm_v3_two_step_op_calls_dit_component(self):
+        class RecordingDenoiser(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def forward(
+                self,
+                hidden_states,
+                timestep,
+                encoder_hidden_states,
+                enable_skip_level,
+            ):
+                self.calls.append(
+                    {
+                        "hidden_shape": tuple(hidden_states.shape),
+                        "timestep": timestep.detach().clone(),
+                        "encoder_dtype": encoder_hidden_states.dtype,
+                        "encoder_device": encoder_hidden_states.device,
+                        "enable_skip_level": enable_skip_level,
+                    }
+                )
+                view_shape = [timestep.shape[0]] + [1] * (hidden_states.ndim - 1)
+                value = timestep.view(*view_shape)
+                output_shape = (
+                    hidden_states.shape[0],
+                    2,
+                    *hidden_states.shape[2:],
+                )
+                return (
+                    torch.ones(
+                        output_shape,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                    * value,
+                )
+
+        hidden = torch.ones(2, 2, 3, 4)
+        encoder = torch.ones(2, 5, 6, dtype=torch.float64)
+        ctx = TrainContext()
+        ctx.set("latent.lq", hidden)
+        ctx.set("text.embedding", encoder)
+
+        model = RecordingDenoiser()
+        op = get_op("nch_ldm_v3_two_step")(
+            {
+                "component": "dit",
+                "input_type": "lq_one_lq",
+                "timesteps": [1.0, 0.4],
+                "enable_skip_level": "60",
+                "inputs": {
+                    "hidden_states": "latent.lq",
+                    "encoder_hidden_states": "text.embedding",
+                },
+                "outputs": {"out": "pred.value"},
+            }
+        )
+        op(ctx, {"dit": model})
+
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(model.calls[0]["hidden_shape"], (2, 8, 3, 4))
+        self.assertEqual(model.calls[0]["enable_skip_level"], "60")
+        self.assertEqual(model.calls[0]["encoder_dtype"], hidden.dtype)
+        self.assertEqual(model.calls[0]["encoder_device"], hidden.device)
+        self.assertTrue(
+            torch.allclose(model.calls[0]["timestep"], torch.full((2,), 1.0))
+        )
+        self.assertTrue(
+            torch.allclose(model.calls[1]["timestep"], torch.full((2,), 0.4))
+        )
+        self.assertTrue(
+            torch.allclose(ctx.get("pred.value"), torch.full_like(hidden, 0.24))
+        )
 
     def test_component_parallel_strategy_defaults_for_fsdp2(self):
         cfg = OmegaConf.create(

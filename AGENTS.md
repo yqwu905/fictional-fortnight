@@ -7,7 +7,7 @@
 - `framework/train.py`: 命令行入口。读取 YAML 配置，合并 dotlist overrides，创建 `Trainer` 并启动训练。
 - `framework/config.py`: 配置加载层。支持文件级 `imports`、`includes`、`include`，以及节点级 `extends`、`_base_`。
 - `framework/engine.py`: 训练主循环。负责分布式初始化、DataLoader、组件构建、日志、checkpoint、TensorBoard 图像写入。
-- `framework/components.py`: 组件生命周期管理。负责 `target + params` 实例化、checkpoint 加载、冻结/解冻、LoRA、DDP 包装、参数统计。
+- `framework/components.py`: 组件生命周期管理。负责 `target + params` 实例化、checkpoint 加载、冻结/解冻、DDP 包装、参数统计。
 - `framework/phase_runner.py`: 训练阶段执行器。按 phase 顺序执行 op、loss、backward、grad clip、optimizer step、scheduler step。
 - `framework/ops/`: 内置 op 注册点。`common.py` 提供通用调用/写 context 操作，`diffusion.py` 提供扩散/flow matching 辅助操作。
 - `framework/losses.py`: loss 包装器。用配置把 context 中的数据映射到 loss 函数参数，并返回加权 loss 与 metrics。
@@ -49,7 +49,7 @@ components:
 约定：
 
 - `target` 必须是完整 Python import path，且构造函数参数只能来自 `params` 或框架注入参数。
-- `train.strategy` 支持 `full`、`frozen`、`keep`、`lora`。
+- `train.strategy` 支持 `full`、`frozen`、`keep`。LoRA 等参数高效微调的挂载交给组件自身初始化实现。
 - `mode` 支持 `train`、`eval`，只控制初始模式；phase 内的 `modes` 可覆盖。
 - `save` 支持 `full`、`none`，LoRA 模块可使用 `lora_only`。
 - checkpoint 可以是裸 `state_dict`，也可以是包含 `state_dict` key 的 dict。

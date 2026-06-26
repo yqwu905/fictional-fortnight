@@ -11,7 +11,6 @@ import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
 from .instantiate import instantiate
-from .registry import get_selector
 from .distributed import (
     DistState,
     fully_shard_module,
@@ -177,40 +176,10 @@ class ComponentManager:
             module.requires_grad_(True)
             return module
 
-        if strategy == "lora":
-            return self.apply_lora(module, train_cfg)
-
         if strategy == 'keep':
             return module
 
         raise ValueError(f"unknown train strategy: {strategy}")
-
-    def apply_lora(self, module, train_cfg):
-        try:
-            from peft import LoraConfig, get_peft_model
-        except Exception as e:
-            raise ImportError("LoRA strategy requires `peft`. Install with `pip install peft`.") from e
-
-        target_policy = train_cfg.get("target_policy", "all_linear")
-        target_modules = train_cfg.get("target_modules")
-
-        if target_modules is None:
-            target_modules = get_selector(target_policy)(module)
-
-        if not target_modules:
-            raise ValueError(f"LoRA target policy {target_policy!r} selected no modules")
-
-        module.requires_grad_(False)
-
-        lora_cfg = LoraConfig(
-            r=int(train_cfg.get("rank", train_cfg.get("r", 16))),
-            lora_alpha=int(train_cfg.get("alpha", train_cfg.get("lora_alpha", 16))),
-            lora_dropout=float(train_cfg.get("dropout", train_cfg.get("lora_dropout", 0.0))),
-            target_modules=target_modules,
-            bias=train_cfg.get("bias", "none"),
-        )
-
-        return get_peft_model(module, lora_cfg)
 
     _GC_METHOD_CANDIDATES = (
         "gradient_checkpointing_enable",

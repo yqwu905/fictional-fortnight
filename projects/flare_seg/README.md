@@ -20,7 +20,8 @@ python scripts/prepare_flareseg_dataset.py \
   --output-dir /content/FlareSeg/data/flareseg_flickr24k_flare7kpp \
   --num-train 24000 \
   --num-val 512 \
-  --image-size 384
+  --image-size 384 \
+  --num-workers 8
 ```
 
 Train with the framework:

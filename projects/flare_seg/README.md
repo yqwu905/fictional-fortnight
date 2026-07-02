@@ -17,7 +17,7 @@ Generate an uploadable image/mask dataset:
 
 ```bash
 python scripts/prepare_flareseg_dataset.py \
-  --output-dir /content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768 \
+  --output-dir /content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768_jpg \
   --num-train 24000 \
   --num-val 512 \
   --output-sizes 768x1536,1536x768 \

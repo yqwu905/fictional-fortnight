@@ -39,12 +39,27 @@ def iter_worker_ranges(length: int, num_workers: int) -> Iterable[Tuple[int, int
             yield start, end
 
 
-def save_one_item(item, *, image_dir: Path, mask_dir: Path, flare_dir: Path, save_flare: bool) -> Dict:
+def save_one_item(
+    item,
+    *,
+    image_dir: Path,
+    mask_dir: Path,
+    flare_dir: Path,
+    save_flare: bool,
+    image_format: str,
+    jpeg_quality: int,
+) -> Dict:
     sample_id = str(item["sample_id"])
-    image_name = f"{sample_id}.png"
+    image_format = image_format.lower()
+    image_ext = "jpg" if image_format in {"jpg", "jpeg"} else "png"
+    image_name = f"{sample_id}.{image_ext}"
     mask_name = f"{sample_id}.png"
 
-    tensor_to_pil_u8(item["viz_image"]).save(image_dir / image_name)
+    image = tensor_to_pil_u8(item["viz_image"])
+    if image_ext == "jpg":
+        image.save(image_dir / image_name, quality=int(jpeg_quality))
+    else:
+        image.save(image_dir / image_name)
     TF.to_pil_image(item["mask"].detach().cpu().clamp(0.0, 1.0)).save(mask_dir / mask_name)
     if save_flare:
         tensor_to_pil_u8(item["flare"]).save(flare_dir / image_name)
@@ -77,6 +92,8 @@ def save_range(
     end: int,
     save_flare: bool,
     progress_every: int,
+    image_format: str,
+    jpeg_quality: int,
 ) -> str:
     output_dir = Path(output_dir)
     image_dir = output_dir / split / "images"
@@ -93,6 +110,8 @@ def save_range(
                 mask_dir=mask_dir,
                 flare_dir=flare_dir,
                 save_flare=save_flare,
+                image_format=image_format,
+                jpeg_quality=jpeg_quality,
             )
             meta.write(json.dumps(record, ensure_ascii=False) + "\n")
             if progress_every > 0 and (idx + 1 == end or (idx - start + 1) % progress_every == 0):
@@ -111,6 +130,8 @@ def save_split(
     save_flare: bool,
     num_workers: int,
     progress_every: int,
+    image_format: str,
+    jpeg_quality: int,
 ) -> None:
     image_dir = output_dir / split / "images"
     mask_dir = output_dir / split / "masks"
@@ -134,6 +155,8 @@ def save_split(
                 end=length,
                 save_flare=save_flare,
                 progress_every=progress_every,
+                image_format=image_format,
+                jpeg_quality=jpeg_quality,
             )
         ]
     else:
@@ -150,6 +173,8 @@ def save_split(
                         "end": end,
                         "save_flare": save_flare,
                         "progress_every": progress_every,
+                        "image_format": image_format,
+                        "jpeg_quality": jpeg_quality,
                     },
                 )
                 for start, end in ranges
@@ -169,7 +194,7 @@ def parse_args():
     parser.add_argument("--flare7kpp-path", default="/content/drive/MyDrive/dataset/Flare7K++.zip")
     parser.add_argument(
         "--output-dir",
-        default="/content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768",
+        default="/content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768_jpg",
     )
     parser.add_argument("--num-train", type=int, default=24000)
     parser.add_argument("--num-val", type=int, default=512)
@@ -179,6 +204,8 @@ def parse_args():
     parser.add_argument("--save-flare", action="store_true")
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--progress-every", type=int, default=500)
+    parser.add_argument("--image-format", choices=["jpg", "png"], default="jpg")
+    parser.add_argument("--jpeg-quality", type=int, default=95)
     parser.add_argument("--mask-absolute-threshold", type=float, default=0.018)
     parser.add_argument("--mask-relative-threshold", type=float, default=0.035)
     parser.add_argument("--mask-dilation", type=int, default=5)
@@ -197,6 +224,7 @@ Each sample contains an RGB image with synthetic flare and a single-channel bina
 covering the full visible flare region, including the light source. The default
 generated sizes are `768x1536` and `1536x768`, matching the target deployment
 image shapes.
+Images are stored as high-quality JPEG by default and masks are stored as PNG.
 
 Generation follows the DeflareMambaV2 data construction pattern: gamma-domain base
 augmentation, noise/gain perturbation, Flare7K++ background removal, color jitter,
@@ -233,6 +261,8 @@ def main():
         save_flare=args.save_flare,
         num_workers=args.num_workers,
         progress_every=args.progress_every,
+        image_format=args.image_format,
+        jpeg_quality=args.jpeg_quality,
     )
     save_split(
         split="validation",
@@ -241,6 +271,8 @@ def main():
         save_flare=args.save_flare,
         num_workers=args.num_workers,
         progress_every=args.progress_every,
+        image_format=args.image_format,
+        jpeg_quality=args.jpeg_quality,
     )
     print(f"saved dataset to {output_dir}")
 

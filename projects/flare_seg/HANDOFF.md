@@ -34,6 +34,7 @@ source archives and synthesizes samples online in the DataLoader.
 - Added `DiceBCELoss` for binary segmentation logits.
 - Added utility scripts:
   - `scripts/visualize_flareseg_samples.py`
+  - `scripts/infer_flareseg.py`
   - `scripts/prepare_flareseg_dataset.py`
   - `scripts/upload_flareseg_dataset.py`
 - `prepare_flareseg_dataset.py` and `upload_flareseg_dataset.py` are optional
@@ -119,6 +120,28 @@ WANDB_API_KEY=<key> python -m framework.train --config configs/flareseg/train_fp
 The current config records scalar metrics and configured images to W&B project
 `flareseg`. Keep the API key in `WANDB_API_KEY`; do not commit it to the repo.
 
+## Inference
+
+Run inference from a framework checkpoint directory or direct `segmenter.pt`:
+
+```bash
+python scripts/infer_flareseg.py \
+  --checkpoint outputs/flareseg_fpn/checkpoint-last \
+  --input /path/to/images \
+  --output-dir outputs/flareseg_infer \
+  --recursive
+```
+
+Outputs are written beside each input's relative path under `--output-dir`:
+
+- `*_prob.png`: sigmoid probability map.
+- `*_mask.png`: binary mask from `sigmoid(logits) >= 0.5`.
+- `*_overlay.png`: red mask overlay on the original image.
+
+Default `--model-size auto` uses `768x1536` for landscape inputs and
+`1536x768` for portrait inputs, then resizes the probability mask back to the
+original image size before saving.
+
 ## Local Partial Artifacts From This Session
 
 These were created locally and are ignored by git:
@@ -133,4 +156,5 @@ They are partial/interrupted artifacts and should not be treated as complete dat
 ## Remaining Tasks
 
 - Run real GPU training with `configs/flareseg/train_fpn_flickr_flare7kpp.yaml`.
-- Add inference/evaluation script for real `1536x768` and `768x1536` images.
+- Run inference/evaluation on a trained checkpoint for real `1536x768` and
+  `768x1536` images.

@@ -14,6 +14,16 @@ data:
       params:
         flickr_path: /content/drive/MyDrive/dataset/Flickr24K.zip
         flare7kpp_path: /content/drive/MyDrive/dataset/Flare7K++.zip
+        flare_include:
+          - Flare7Kpp/Flare7K/Scattering_Flare/Compound_Flare/
+          - Flare7Kpp/Flare7K/Reflective_Flare/
+          - Flare7Kpp/Flare-R/Compound_Flare/
+        flare_exclude:
+          - Light_Source/
+          - test_data/
+          - /input/
+          - /gt/
+          - /mask/
         length: 24000
         output_sizes:
           - [768, 1536]

@@ -10,6 +10,25 @@ from torch.utils.data import Dataset, Sampler
 from .synthesis import ImageSource, synthesize_flare_sample
 
 
+FLARE7KPP_FLARE_INCLUDES = (
+    "Flare7Kpp/Flare7K/Scattering_Flare/Compound_Flare/",
+    "Flare7Kpp/Flare7K/Reflective_Flare/",
+    "Flare7Kpp/Flare-R/Compound_Flare/",
+)
+
+FLARE7KPP_NON_FLARE_EXCLUDES = (
+    "Light_Source/",
+    "test_data/",
+    "/input/",
+    "/gt/",
+    "/mask/",
+)
+
+
+def _looks_like_flare7kpp_path(path: str) -> bool:
+    return "flare7k" in str(path).lower()
+
+
 class FlareSegSyntheticDataset(Dataset):
     """On-the-fly flare segmentation data from Flickr24K backgrounds and Flare7K++ flares."""
 
@@ -26,13 +45,23 @@ class FlareSegSyntheticDataset(Dataset):
         image_mean: Sequence[float] = (0.485, 0.456, 0.406),
         image_std: Sequence[float] = (0.229, 0.224, 0.225),
         flare_include: Optional[Sequence[str]] = None,
+        flare_exclude: Optional[Sequence[str]] = None,
         mask_absolute_threshold: float = 0.018,
         mask_relative_threshold: float = 0.035,
         mask_dilation: int = 5,
         size_selection: str = "random",
     ):
         self.base_source = ImageSource(flickr_path)
-        self.flare_source = ImageSource(flare7kpp_path, include=flare_include)
+        if flare_include is None and _looks_like_flare7kpp_path(flare7kpp_path):
+            flare_include = FLARE7KPP_FLARE_INCLUDES
+        if flare_exclude is None and _looks_like_flare7kpp_path(flare7kpp_path):
+            flare_exclude = FLARE7KPP_NON_FLARE_EXCLUDES
+
+        self.flare_source = ImageSource(
+            flare7kpp_path,
+            include=flare_include,
+            exclude=flare_exclude,
+        )
         self.length = int(length or len(self.base_source))
         self.output_sizes = self._resolve_output_sizes(image_size, output_sizes)
         self.seed = int(seed)

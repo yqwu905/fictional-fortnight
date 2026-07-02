@@ -15,6 +15,21 @@ from projects.flare_seg.dataset import FlareSegSyntheticDataset
 from projects.flare_seg.synthesis import tensor_to_pil_u8
 
 
+def parse_size(value: str) -> Tuple[int, int]:
+    normalized = value.lower().replace(" ", "")
+    parts = normalized.split("x")
+    if len(parts) != 2:
+        raise ValueError(f"expected size as HxW, got: {value}")
+    height, width = int(parts[0]), int(parts[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"size must be positive, got: {value}")
+    return height, width
+
+
+def parse_sizes(value: str) -> Tuple[Tuple[int, int], ...]:
+    return tuple(parse_size(item) for item in value.split(",") if item.strip())
+
+
 def iter_worker_ranges(length: int, num_workers: int) -> Iterable[Tuple[int, int]]:
     chunk = (length + num_workers - 1) // num_workers
     for worker_id in range(num_workers):
@@ -38,6 +53,8 @@ def save_one_item(item, *, image_dir: Path, mask_dir: Path, flare_dir: Path, sav
         "sample_id": sample_id,
         "image": f"images/{image_name}",
         "mask": f"masks/{mask_name}",
+        "height": int(item["viz_image"].shape[-2]),
+        "width": int(item["viz_image"].shape[-1]),
         "base_path": item["base_path"],
         "flare_path": item["flare_path"],
         "mask_ratio": float(item["mask_ratio"].item()),
@@ -150,10 +167,14 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--flickr-path", default="/content/drive/MyDrive/dataset/Flickr24K.zip")
     parser.add_argument("--flare7kpp-path", default="/content/drive/MyDrive/dataset/Flare7K++.zip")
-    parser.add_argument("--output-dir", default="/content/FlareSeg/data/flareseg_flickr24k_flare7kpp")
+    parser.add_argument(
+        "--output-dir",
+        default="/content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768",
+    )
     parser.add_argument("--num-train", type=int, default=24000)
     parser.add_argument("--num-val", type=int, default=512)
-    parser.add_argument("--image-size", type=int, default=384)
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--output-sizes", default="768x1536,1536x768")
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--save-flare", action="store_true")
     parser.add_argument("--num-workers", type=int, default=1)
@@ -173,7 +194,9 @@ Synthetic binary flare segmentation dataset generated from:
 - Flare7K++ flare assets: `{args.flare7kpp_path}`
 
 Each sample contains an RGB image with synthetic flare and a single-channel binary mask
-covering the full visible flare region, including the light source.
+covering the full visible flare region, including the light source. The default
+generated sizes are `768x1536` and `1536x768`, matching the target deployment
+image shapes.
 
 Generation follows the DeflareMambaV2 data construction pattern: gamma-domain base
 augmentation, noise/gain perturbation, Flare7K++ background removal, color jitter,
@@ -194,6 +217,7 @@ def main():
         "flickr_path": args.flickr_path,
         "flare7kpp_path": args.flare7kpp_path,
         "image_size": args.image_size,
+        "output_sizes": parse_sizes(args.output_sizes),
         "deterministic": True,
         "mask_absolute_threshold": args.mask_absolute_threshold,
         "mask_relative_threshold": args.mask_relative_threshold,

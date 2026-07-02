@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import replace
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -18,7 +18,8 @@ class FlareSegSyntheticDataset(Dataset):
         flickr_path: str = "/content/drive/MyDrive/dataset/Flickr24K.zip",
         flare7kpp_path: str = "/content/drive/MyDrive/dataset/Flare7K++.zip",
         length: Optional[int] = None,
-        image_size: int = 384,
+        image_size: int | None = None,
+        output_sizes: Optional[Sequence[Sequence[int]]] = None,
         seed: int = 3407,
         deterministic: bool = False,
         normalize: bool = False,
@@ -32,7 +33,7 @@ class FlareSegSyntheticDataset(Dataset):
         self.base_source = ImageSource(flickr_path)
         self.flare_source = ImageSource(flare7kpp_path, include=flare_include)
         self.length = int(length or len(self.base_source))
-        self.image_size = int(image_size)
+        self.output_sizes = self._resolve_output_sizes(image_size, output_sizes)
         self.seed = int(seed)
         self.deterministic = bool(deterministic)
         self.normalize = bool(normalize)
@@ -44,6 +45,28 @@ class FlareSegSyntheticDataset(Dataset):
 
         if self.length <= 0:
             raise ValueError("length must be positive")
+
+    @staticmethod
+    def _resolve_output_sizes(
+        image_size: int | None,
+        output_sizes: Optional[Sequence[Sequence[int]]],
+    ) -> Tuple[Tuple[int, int], ...]:
+        if output_sizes is None:
+            if image_size is None:
+                output_sizes = ((768, 1536), (1536, 768))
+            else:
+                side = int(image_size)
+                output_sizes = ((side, side),)
+
+        sizes = []
+        for size in output_sizes:
+            if len(size) != 2:
+                raise ValueError(f"output size must be [height, width], got: {size}")
+            height, width = int(size[0]), int(size[1])
+            if height <= 0 or width <= 0:
+                raise ValueError(f"output size must be positive, got: {size}")
+            sizes.append((height, width))
+        return tuple(sizes)
 
     def __len__(self) -> int:
         return self.length
@@ -57,6 +80,7 @@ class FlareSegSyntheticDataset(Dataset):
         rng = self._rng(index)
         base_index = int(index) % len(self.base_source)
         flare_index = rng.randrange(len(self.flare_source))
+        output_size = self.output_sizes[rng.randrange(len(self.output_sizes))]
         base_image = self.base_source.open_rgb(base_index)
         flare_image = self.flare_source.open_rgb(flare_index)
 
@@ -64,7 +88,7 @@ class FlareSegSyntheticDataset(Dataset):
             base_image,
             flare_image,
             rng,
-            image_size=self.image_size,
+            output_size=output_size,
             mask_absolute_threshold=self.mask_absolute_threshold,
             mask_relative_threshold=self.mask_relative_threshold,
             mask_dilation=self.mask_dilation,

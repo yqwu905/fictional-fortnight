@@ -10,17 +10,17 @@ Default data sources:
 Preview synthesized image/mask pairs:
 
 ```bash
-python scripts/visualize_flareseg_samples.py --samples 8
+python scripts/visualize_flareseg_samples.py --samples 8 --output-size 768x1536
 ```
 
 Generate an uploadable image/mask dataset:
 
 ```bash
 python scripts/prepare_flareseg_dataset.py \
-  --output-dir /content/FlareSeg/data/flareseg_flickr24k_flare7kpp \
+  --output-dir /content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768 \
   --num-train 24000 \
   --num-val 512 \
-  --image-size 384 \
+  --output-sizes 768x1536,1536x768 \
   --num-workers 8
 ```
 

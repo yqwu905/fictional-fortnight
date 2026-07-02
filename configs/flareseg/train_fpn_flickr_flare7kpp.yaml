@@ -15,7 +15,9 @@ data:
         flickr_path: /content/drive/MyDrive/dataset/Flickr24K.zip
         flare7kpp_path: /content/drive/MyDrive/dataset/Flare7K++.zip
         length: 24000
-        image_size: 384
+        output_sizes:
+          - [768, 1536]
+          - [1536, 768]
         seed: 3407
         deterministic: false
         normalize: false
@@ -23,7 +25,7 @@ data:
         mask_relative_threshold: 0.035
         mask_dilation: 5
     dataloader:
-      batch_size: 4
+      batch_size: 1
       shuffle: true
       num_workers: 4
       drop_last: true

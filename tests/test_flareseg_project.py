@@ -31,13 +31,13 @@ class FlareSegProjectTest(unittest.TestCase):
                 flickr_path=str(flickr),
                 flare7kpp_path=str(flare),
                 length=1,
-                image_size=96,
+                output_sizes=[[96, 192]],
                 deterministic=True,
             )
             item = dataset[0]
 
-            self.assertEqual(tuple(item["image"].shape), (3, 96, 96))
-            self.assertEqual(tuple(item["mask"].shape), (1, 96, 96))
+            self.assertEqual(tuple(item["image"].shape), (3, 96, 192))
+            self.assertEqual(tuple(item["mask"].shape), (1, 96, 192))
             self.assertGreater(float(item["mask"].max()), 0.0)
             self.assertLess(float(item["mask"].mean()), 1.0)
 
@@ -55,4 +55,3 @@ class FlareSegProjectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

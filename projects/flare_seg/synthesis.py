@@ -174,7 +174,7 @@ def random_base_tensor(
     image: Image.Image,
     rng: random.Random,
     *,
-    image_size: int,
+    output_size: Tuple[int, int],
     crop_scale: Tuple[float, float] = (0.55, 1.0),
 ) -> torch.Tensor:
     top, left, crop_h, crop_w = random_resized_crop_params(
@@ -189,7 +189,7 @@ def random_base_tensor(
         left,
         crop_h,
         crop_w,
-        [image_size, image_size],
+        list(output_size),
         interpolation=InterpolationMode.BICUBIC,
         antialias=True,
     )
@@ -210,7 +210,7 @@ def transform_flare_tensor(
     flare: torch.Tensor,
     rng: random.Random,
     *,
-    image_size: int,
+    output_size: Tuple[int, int],
     min_scale: float = 0.75,
     max_scale: float = 1.35,
     max_translate: float = 0.18,
@@ -218,14 +218,19 @@ def transform_flare_tensor(
 ) -> torch.Tensor:
     flare = TF.resize(
         flare,
-        [image_size, image_size],
+        list(output_size),
         interpolation=InterpolationMode.BILINEAR,
         antialias=True,
     )
     angle = rng.uniform(-max_degrees, max_degrees)
     scale = rng.uniform(min_scale, max_scale)
-    max_shift = int(round(image_size * max_translate))
-    translate = (rng.randint(-max_shift, max_shift), rng.randint(-max_shift, max_shift))
+    height, width = output_size
+    max_shift_x = int(round(width * max_translate))
+    max_shift_y = int(round(height * max_translate))
+    translate = (
+        rng.randint(-max_shift_x, max_shift_x),
+        rng.randint(-max_shift_y, max_shift_y),
+    )
     flare = TF.affine(
         flare,
         angle=angle,
@@ -276,14 +281,14 @@ def synthesize_flare_sample(
     flare_image: Image.Image,
     rng: random.Random,
     *,
-    image_size: int = 384,
+    output_size: Tuple[int, int] = (768, 1536),
     mask_absolute_threshold: float = 0.018,
     mask_relative_threshold: float = 0.035,
     mask_dilation: int = 5,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, SynthesisRecord]:
     gamma = rng.uniform(1.8, 2.2)
     torch_generator = torch.Generator().manual_seed(rng.randrange(2**63 - 1))
-    base = random_base_tensor(base_image, rng, image_size=image_size)
+    base = random_base_tensor(base_image, rng, output_size=output_size)
     base_linear = TF.adjust_gamma(base, gamma, gain=1.0)
 
     sigma = 0.01 * (rng.gauss(0.0, 1.0) ** 2)
@@ -299,7 +304,7 @@ def synthesize_flare_sample(
     flare = pil_to_tensor(flare_image)
     flare = TF.adjust_gamma(flare, gamma, gain=1.0)
     flare = remove_flare_background(flare).clamp(0.0, 1.0)
-    flare = transform_flare_tensor(flare, rng, image_size=image_size)
+    flare = transform_flare_tensor(flare, rng, output_size=output_size)
 
     brightness = rng.uniform(0.8, 3.0)
     hue = rng.uniform(-0.02, 0.02)

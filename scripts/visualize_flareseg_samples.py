@@ -28,13 +28,29 @@ def add_label(image: Image.Image, label: str) -> Image.Image:
     return image
 
 
-def build_sheet(dataset: FlareSegSyntheticDataset, samples: int, tile_size: int) -> Image.Image:
+def parse_size(value: str) -> tuple[int, int]:
+    normalized = value.lower().replace(",", "x").replace(" ", "")
+    parts = normalized.split("x")
+    if len(parts) != 2:
+        raise ValueError(f"expected size as HxW, got: {value}")
+    height, width = int(parts[0]), int(parts[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"size must be positive, got: {value}")
+    return height, width
+
+
+def build_sheet(
+    dataset: FlareSegSyntheticDataset,
+    samples: int,
+    tile_size: tuple[int, int],
+) -> Image.Image:
+    tile_width, tile_height = tile_size
     rows = []
     for i in range(samples):
         item = dataset[i]
-        image = tensor_to_pil_u8(item["viz_image"]).resize((tile_size, tile_size))
-        mask = tensor_to_pil_u8(item["mask"]).convert("L").resize((tile_size, tile_size))
-        flare = tensor_to_pil_u8(item["flare"]).resize((tile_size, tile_size))
+        image = tensor_to_pil_u8(item["viz_image"]).resize((tile_width, tile_height))
+        mask = tensor_to_pil_u8(item["mask"]).convert("L").resize((tile_width, tile_height))
+        flare = tensor_to_pil_u8(item["flare"]).resize((tile_width, tile_height))
         overlay = make_overlay(image, mask)
         ratio = float(item["mask_ratio"].item())
 
@@ -44,14 +60,14 @@ def build_sheet(dataset: FlareSegSyntheticDataset, samples: int, tile_size: int)
             add_label(mask.convert("RGB"), "mask"),
             add_label(flare, "synthetic flare"),
         ]
-        row = Image.new("RGB", (tile_size * len(tiles), tile_size), (255, 255, 255))
+        row = Image.new("RGB", (tile_width * len(tiles), tile_height), (255, 255, 255))
         for j, tile in enumerate(tiles):
-            row.paste(tile, (j * tile_size, 0))
+            row.paste(tile, (j * tile_width, 0))
         rows.append(row)
 
-    sheet = Image.new("RGB", (rows[0].width, tile_size * len(rows)), (255, 255, 255))
+    sheet = Image.new("RGB", (rows[0].width, tile_height * len(rows)), (255, 255, 255))
     for i, row in enumerate(rows):
-        sheet.paste(row, (0, i * tile_size))
+        sheet.paste(row, (0, i * tile_height))
     return sheet
 
 
@@ -61,8 +77,8 @@ def parse_args():
     parser.add_argument("--flare7kpp-path", default="/content/drive/MyDrive/dataset/Flare7K++.zip")
     parser.add_argument("--output", default="outputs/flareseg_samples/preview.png")
     parser.add_argument("--samples", type=int, default=8)
-    parser.add_argument("--image-size", type=int, default=384)
-    parser.add_argument("--tile-size", type=int, default=256)
+    parser.add_argument("--output-size", default="768x1536")
+    parser.add_argument("--tile-width", type=int, default=256)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--mask-absolute-threshold", type=float, default=0.018)
     parser.add_argument("--mask-relative-threshold", type=float, default=0.035)
@@ -76,7 +92,7 @@ def main():
         flickr_path=args.flickr_path,
         flare7kpp_path=args.flare7kpp_path,
         length=args.samples,
-        image_size=args.image_size,
+        output_sizes=[parse_size(args.output_size)],
         seed=args.seed,
         deterministic=True,
         mask_absolute_threshold=args.mask_absolute_threshold,
@@ -85,7 +101,9 @@ def main():
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    sheet = build_sheet(dataset, args.samples, args.tile_size)
+    height, width = parse_size(args.output_size)
+    tile_size = (args.tile_width, max(1, round(args.tile_width * height / width)))
+    sheet = build_sheet(dataset, args.samples, tile_size)
     sheet.save(output)
     print(f"saved preview to {output}")
 

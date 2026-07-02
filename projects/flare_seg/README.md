@@ -2,6 +2,9 @@
 
 Train `models.fpn.FPNAdvance_f4` as a binary flare segmentation network.
 
+See `projects/flare_seg/HANDOFF.md` for the current progress, validation notes,
+and remaining generation/upload steps.
+
 Default data sources:
 
 - `/content/drive/MyDrive/dataset/Flare7K++.zip`

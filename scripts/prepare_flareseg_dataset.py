@@ -220,11 +220,17 @@ Synthetic binary flare segmentation dataset generated from:
 - Flickr24K backgrounds: `{args.flickr_path}`
 - Flare7K++ flare assets: `{args.flare7kpp_path}`
 
+Splits:
+
+- train: `{args.num_train}` samples
+- validation: `{args.num_val}` samples
+
 Each sample contains an RGB image with synthetic flare and a single-channel binary mask
 covering the full visible flare region, including the light source. The default
 generated sizes are `768x1536` and `1536x768`, matching the target deployment
 image shapes.
-Images are stored as high-quality JPEG by default and masks are stored as PNG.
+Images are stored as `{args.image_format}` with JPEG quality `{args.jpeg_quality}` when
+applicable. Masks are stored as PNG.
 
 Generation follows the DeflareMambaV2 data construction pattern: gamma-domain base
 augmentation, noise/gain perturbation, Flare7K++ background removal, color jitter,

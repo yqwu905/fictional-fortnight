@@ -81,8 +81,17 @@ checkpoint:
 
 logging:
   reduce_metrics: true
-  tensorboard:
-    enabled: true
+  backends:
+    - type: tensorboard
+      enabled: true
+    - type: wandb
+      enabled: true
+      project: flareseg
+      name: fpn-flickr24k-flare7kpp-online
+      tags:
+        - flareseg
+        - fpn
+        - online-synthesis
   images:
     enabled: true
     every_n_steps: 100
@@ -90,10 +99,10 @@ logging:
     items:
       - tag: flare/input
         key: batch.viz_image
-        value_range: 0_1
+        value_range: "0_1"
       - tag: flare/mask
         key: batch.mask
-        value_range: 0_1
+        value_range: "0_1"
 
 train_program:
   phases:

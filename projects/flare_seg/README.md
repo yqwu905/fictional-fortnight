@@ -3,7 +3,7 @@
 Train `models.fpn.FPNAdvance_f4` as a binary flare segmentation network.
 
 See `projects/flare_seg/HANDOFF.md` for the current progress, validation notes,
-and remaining generation/upload steps.
+and training notes.
 
 Default data sources:
 
@@ -16,19 +16,13 @@ Preview synthesized image/mask pairs:
 python scripts/visualize_flareseg_samples.py --samples 8 --output-size 768x1536
 ```
 
-Generate an uploadable image/mask dataset:
-
-```bash
-python scripts/prepare_flareseg_dataset.py \
-  --output-dir /content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768_jpg \
-  --num-train 24000 \
-  --num-val 512 \
-  --output-sizes 768x1536,1536x768 \
-  --num-workers 8
-```
+Training does not require a prepared image/mask dataset. The framework
+DataLoader instantiates `projects.flare_seg.dataset.FlareSegSyntheticDataset`,
+which reads Flickr24K and Flare7K++ directly and synthesizes each sample inside
+`__getitem__`.
 
 Train with the framework:
 
 ```bash
-python -m framework.train --config configs/flareseg/train_fpn_flickr_flare7kpp.yaml
+WANDB_API_KEY=... python -m framework.train --config configs/flareseg/train_fpn_flickr_flare7kpp.yaml
 ```

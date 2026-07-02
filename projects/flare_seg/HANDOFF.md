@@ -13,12 +13,13 @@ Last updated: 2026-07-02
   - Flare7K++: `/content/drive/MyDrive/dataset/Flare7K++.zip`
   - Flickr24K: `/content/drive/MyDrive/dataset/Flickr24K.zip`
 
-No dataset has been uploaded to Hugging Face yet. Generation/upload was intentionally stopped so it can be run on a faster machine.
+No prepared dataset is required for the current training path. Training reads the
+source archives and synthesizes samples online in the DataLoader.
 
 ## Implemented
 
 - Added `models.fpn.FPNAdvance_f4` and its `repvit_m` dependency under `models/`.
-- Added on-the-fly synthetic dataset code in `projects/flare_seg/`.
+- Added DataLoader-time synthetic dataset code in `projects/flare_seg/`.
 - Data synthesis follows the DeflareMambaV2 pattern:
   - gamma-domain base augmentation
   - noise and gain perturbation
@@ -31,11 +32,12 @@ No dataset has been uploaded to Hugging Face yet. Generation/upload was intentio
   - `1536x768`
 - `FPNAdvance_f4` was verified to run directly on both deployment shapes. It fails on `1024x1024`, so do not switch to 1024 without padding/cropping support.
 - Added `DiceBCELoss` for binary segmentation logits.
-- Added scripts:
+- Added utility scripts:
   - `scripts/visualize_flareseg_samples.py`
   - `scripts/prepare_flareseg_dataset.py`
   - `scripts/upload_flareseg_dataset.py`
-- Prepared dataset script writes high-quality JPEG images by default and PNG masks.
+- `prepare_flareseg_dataset.py` and `upload_flareseg_dataset.py` are optional
+  archival/debug utilities and are not part of the training path.
 - Added lightweight tests in `tests/test_flareseg_project.py`.
 
 ## Validation Already Run
@@ -94,92 +96,28 @@ These are ignored by git and not pushed.
 - Input values are in `[0, 1]` by default; `normalize: false` in the training config.
 - Output is a single logit channel. Use `sigmoid(logits) > 0.5` for a binary mask.
 
-## Generate Dataset On Faster Machine
+## Online Synthesis Training
 
-Recommended full dataset command:
+Do not pre-generate a training dataset for the normal path. The config uses
+`projects.flare_seg.dataset.FlareSegSyntheticDataset`, and PyTorch DataLoader
+workers synthesize image/mask pairs online from:
 
-```bash
-python scripts/prepare_flareseg_dataset.py \
-  --output-dir /content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768_jpg \
-  --num-train 24000 \
-  --num-val 512 \
-  --output-sizes 768x1536,1536x768 \
-  --num-workers 4 \
-  --progress-every 250 \
-  --image-format jpg \
-  --jpeg-quality 95
-```
+- `/content/drive/MyDrive/dataset/Flickr24K.zip`
+- `/content/drive/MyDrive/dataset/Flare7K++.zip`
 
-If the new machine has many CPU cores and fast storage, try `--num-workers 8` or `--num-workers 16`, but benchmark first. In the current Colab-like environment:
-
-- `4` workers generated roughly dozens of images per minute.
-- `8` workers had high startup overhead because every worker scans the zip archives.
-- Full `24000 + 512` generation was estimated to take too long here.
-
-For a quick sanity check before full generation:
-
-```bash
-python scripts/prepare_flareseg_dataset.py \
-  --output-dir /tmp/flareseg-jpg-mini \
-  --num-train 4 \
-  --num-val 2 \
-  --output-sizes 768x1536,1536x768 \
-  --num-workers 1 \
-  --progress-every 1 \
-  --image-format jpg \
-  --jpeg-quality 95
-```
-
-Expected structure:
-
-```text
-train/images/*.jpg
-train/masks/*.png
-train/metadata.jsonl
-validation/images/*.jpg
-validation/masks/*.png
-validation/metadata.jsonl
-README.md
-```
-
-`metadata.jsonl` includes `height`, `width`, `base_path`, `flare_path`, `mask_ratio`, `gamma`, `gain`, `flare_dc_offset`, and `flare_luminance_max`.
-
-## Upload Dataset To Hugging Face
-
-Suggested dataset repo id:
-
-```text
-yuanqingwu/flareseg-flickr24k-flare7kpp-1536x768-jpg
-```
-
-Upload after generation:
-
-```bash
-python scripts/upload_flareseg_dataset.py \
-  --dataset-dir /content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768_jpg \
-  --repo-id yuanqingwu/flareseg-flickr24k-flare7kpp-1536x768-jpg
-```
-
-Alternative with HF CLI:
-
-```bash
-hf upload yuanqingwu/flareseg-flickr24k-flare7kpp-1536x768-jpg \
-  /content/FlareSeg/data/flareseg_flickr24k_flare7kpp_1536x768_jpg \
-  --type dataset \
-  --commit-message "Upload FlareSeg synthetic dataset"
-```
-
-Do not commit tokens or credentials to the repo.
+The optional prepare/upload scripts remain only for offline inspection or
+archival exports.
 
 ## Train
 
-After data generation/upload, train directly from online synthesis:
+Train directly from online synthesis:
 
 ```bash
-python -m framework.train --config configs/flareseg/train_fpn_flickr_flare7kpp.yaml
+WANDB_API_KEY=<key> python -m framework.train --config configs/flareseg/train_fpn_flickr_flare7kpp.yaml
 ```
 
-The current config still reads the local zip files and synthesizes on the fly. If you prefer training from the prepared JPEG/PNG dataset, add a file-backed dataset class or adapt the current dataset to read `metadata.jsonl`.
+The current config records scalar metrics and configured images to W&B project
+`flareseg`. Keep the API key in `WANDB_API_KEY`; do not commit it to the repo.
 
 ## Local Partial Artifacts From This Session
 
@@ -194,10 +132,5 @@ They are partial/interrupted artifacts and should not be treated as complete dat
 
 ## Remaining Tasks
 
-- Generate the full `24000` train and `512` validation prepared dataset on a faster machine.
-- Visually inspect several generated `768x1536` and `1536x768` samples before full upload.
-- Upload the prepared dataset to Hugging Face.
-- Optionally add a file-backed dataset class for training from the uploaded JPEG/PNG dataset.
 - Run real GPU training with `configs/flareseg/train_fpn_flickr_flare7kpp.yaml`.
 - Add inference/evaluation script for real `1536x768` and `768x1536` images.
-

@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 from PIL import Image, ImageDraw
 
+from framework.config import load_config
 from projects.flare_seg.dataset import FlareSegSyntheticDataset
 from projects.flare_seg.losses import DiceBCELoss
 
@@ -51,6 +52,21 @@ class FlareSegProjectTest(unittest.TestCase):
         self.assertIn("loss", result)
         self.assertIn("iou_0.5", result)
         self.assertTrue(torch.is_tensor(result["loss"]))
+
+    def test_training_config_uses_online_synthesis_and_wandb(self):
+        cfg = load_config("configs/flareseg/train_fpn_flickr_flare7kpp.yaml")
+
+        self.assertEqual(
+            cfg.data.train.dataset.target,
+            "projects.flare_seg.dataset.FlareSegSyntheticDataset",
+        )
+        backend_types = [backend.type for backend in cfg.logging.backends]
+        self.assertIn("wandb", backend_types)
+        wandb_cfg = next(backend for backend in cfg.logging.backends if backend.type == "wandb")
+        self.assertTrue(wandb_cfg.enabled)
+        self.assertEqual(wandb_cfg.project, "flareseg")
+        image_ranges = [item.value_range for item in cfg.logging.images["items"]]
+        self.assertEqual(image_ranges, ["0_1", "0_1"])
 
 
 if __name__ == "__main__":

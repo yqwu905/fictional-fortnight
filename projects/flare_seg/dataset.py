@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import random
 from dataclasses import replace
-from typing import Optional, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from .synthesis import ImageSource, synthesize_flare_sample
 
@@ -29,6 +29,7 @@ class FlareSegSyntheticDataset(Dataset):
         mask_absolute_threshold: float = 0.018,
         mask_relative_threshold: float = 0.035,
         mask_dilation: int = 5,
+        size_selection: str = "random",
     ):
         self.base_source = ImageSource(flickr_path)
         self.flare_source = ImageSource(flare7kpp_path, include=flare_include)
@@ -42,9 +43,15 @@ class FlareSegSyntheticDataset(Dataset):
         self.mask_absolute_threshold = float(mask_absolute_threshold)
         self.mask_relative_threshold = float(mask_relative_threshold)
         self.mask_dilation = int(mask_dilation)
+        self.size_selection = str(size_selection)
 
         if self.length <= 0:
             raise ValueError("length must be positive")
+        if self.size_selection not in {"random", "index_mod"}:
+            raise ValueError(
+                "size_selection must be 'random' or 'index_mod', "
+                f"got: {self.size_selection!r}"
+            )
 
     @staticmethod
     def _resolve_output_sizes(
@@ -76,11 +83,23 @@ class FlareSegSyntheticDataset(Dataset):
             return random.Random(self.seed + int(index))
         return random.Random(self.seed + int(index) * 1_000_003 + random.randrange(1 << 30))
 
+    @property
+    def num_size_buckets(self) -> int:
+        return len(self.output_sizes)
+
+    def size_bucket_for_index(self, index: int) -> int:
+        return int(index) % self.num_size_buckets
+
+    def output_size_for_index(self, index: int, rng: random.Random) -> Tuple[int, int]:
+        if self.size_selection == "index_mod":
+            return self.output_sizes[self.size_bucket_for_index(index)]
+        return self.output_sizes[rng.randrange(len(self.output_sizes))]
+
     def __getitem__(self, index: int):
         rng = self._rng(index)
         base_index = int(index) % len(self.base_source)
         flare_index = rng.randrange(len(self.flare_source))
-        output_size = self.output_sizes[rng.randrange(len(self.output_sizes))]
+        output_size = self.output_size_for_index(index, rng)
         base_image = self.base_source.open_rgb(base_index)
         flare_image = self.flare_source.open_rgb(flare_index)
 
@@ -118,3 +137,73 @@ class FlareSegSyntheticDataset(Dataset):
             "flare_dc_offset": torch.tensor(record.flare_dc_offset, dtype=torch.float32),
             "flare_luminance_max": torch.tensor(record.flare_luminance_max, dtype=torch.float32),
         }
+
+
+class SameOutputSizeBatchSampler(Sampler[List[int]]):
+    """Yield batches whose indices map to the same dataset output size."""
+
+    def __init__(
+        self,
+        dataset: FlareSegSyntheticDataset,
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = True,
+        seed: int = 3407,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if not hasattr(dataset, "size_bucket_for_index"):
+            raise TypeError("dataset must implement size_bucket_for_index(index)")
+
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        batches: List[List[int]] = []
+
+        for bucket_id in range(self.dataset.num_size_buckets):
+            indices = [
+                index
+                for index in range(len(self.dataset))
+                if self.dataset.size_bucket_for_index(index) == bucket_id
+            ]
+            if self.shuffle:
+                rng.shuffle(indices)
+
+            for start in range(0, len(indices), self.batch_size):
+                batch = indices[start : start + self.batch_size]
+                if len(batch) == self.batch_size or (batch and not self.drop_last):
+                    batches.append(batch)
+
+        if self.shuffle:
+            rng.shuffle(batches)
+
+        for batch_index, batch in enumerate(batches):
+            if batch_index % self.world_size == self.rank:
+                yield batch
+
+    def __len__(self) -> int:
+        total = 0
+        for bucket_id in range(self.dataset.num_size_buckets):
+            bucket_len = sum(
+                1
+                for index in range(len(self.dataset))
+                if self.dataset.size_bucket_for_index(index) == bucket_id
+            )
+            if self.drop_last:
+                total += bucket_len // self.batch_size
+            else:
+                total += (bucket_len + self.batch_size - 1) // self.batch_size
+        return (total + self.world_size - 1 - self.rank) // self.world_size

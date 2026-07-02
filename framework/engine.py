@@ -80,6 +80,7 @@ def build_dataloader(data_cfg, dist_state=None):
     data_cfg = _plain(data_cfg)
     dataset = instantiate(data_cfg["dataset"])
     dl_cfg = dict(data_cfg.get("dataloader", {}) or {})
+    batch_sampler_cfg = dl_cfg.pop("batch_sampler", None)
 
     num_workers = int(dl_cfg.get("num_workers", 0))
 
@@ -90,9 +91,25 @@ def build_dataloader(data_cfg, dist_state=None):
         dl_cfg.setdefault("timeout", 60)
         dl_cfg.setdefault("multiprocessing_context", "spawn")
 
+    batch_sampler = None
+    if batch_sampler_cfg is not None:
+        rank = dist_state.rank if dist_state is not None and dist_state.enabled else 0
+        world_size = (
+            dist_state.world_size if dist_state is not None and dist_state.enabled else 1
+        )
+        batch_sampler = instantiate(
+            batch_sampler_cfg,
+            dataset=dataset,
+            rank=rank,
+            world_size=world_size,
+        )
+        for key in ("batch_size", "shuffle", "sampler", "drop_last"):
+            dl_cfg.pop(key, None)
+        dl_cfg["batch_sampler"] = batch_sampler
+
     sampler = None
 
-    if dist_state is not None and dist_state.enabled:
+    if batch_sampler is None and dist_state is not None and dist_state.enabled:
         shuffle = bool(dl_cfg.pop("shuffle", True))
         drop_last = bool(dl_cfg.get("drop_last", False))
 
@@ -217,6 +234,9 @@ class Trainer:
             sampler = getattr(self.train_loader, "sampler", None)
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
+            batch_sampler = getattr(self.train_loader, "batch_sampler", None)
+            if hasattr(batch_sampler, "set_epoch"):
+                batch_sampler.set_epoch(epoch)
 
             data_t0 = time.perf_counter()
             for batch in self.train_loader:

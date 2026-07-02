@@ -20,15 +20,23 @@ data:
           - [1536, 768]
         seed: 3407
         deterministic: false
+        size_selection: index_mod
         normalize: false
         mask_absolute_threshold: 0.018
         mask_relative_threshold: 0.035
         mask_dilation: 5
     dataloader:
-      batch_size: 1
-      shuffle: true
+      batch_sampler:
+        target: projects.flare_seg.dataset.SameOutputSizeBatchSampler
+        params:
+          batch_size: 2
+          shuffle: true
+          drop_last: true
+          seed: 3407
       num_workers: 4
-      drop_last: true
+      pin_memory: true
+      persistent_workers: true
+      prefetch_factor: 2
 
 components:
   segmenter:
@@ -103,6 +111,9 @@ logging:
       - tag: flare/mask
         key: batch.mask
         value_range: "0_1"
+      - tag: flare/pred_mask
+        key: pred.mask_prob
+        value_range: "0_1"
 
 train_program:
   phases:
@@ -118,6 +129,12 @@ train_program:
             x: batch.image
           outputs:
             _: pred.logits
+        prediction_mask:
+          function: torch.sigmoid
+          inputs:
+            input: pred.logits
+          outputs:
+            _: pred.mask_prob
       losses:
         - seg
       backward: true

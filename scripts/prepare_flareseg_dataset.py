@@ -59,6 +59,7 @@ def save_range(
     start: int,
     end: int,
     save_flare: bool,
+    progress_every: int,
 ) -> str:
     output_dir = Path(output_dir)
     image_dir = output_dir / split / "images"
@@ -77,6 +78,11 @@ def save_range(
                 save_flare=save_flare,
             )
             meta.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if progress_every > 0 and (idx + 1 == end or (idx - start + 1) % progress_every == 0):
+                print(
+                    f"[{split}] {start:08d}-{end:08d}: {idx - start + 1}/{end - start}",
+                    flush=True,
+                )
     return str(part_path)
 
 
@@ -87,6 +93,7 @@ def save_split(
     dataset_kwargs: Dict,
     save_flare: bool,
     num_workers: int,
+    progress_every: int,
 ) -> None:
     image_dir = output_dir / split / "images"
     mask_dir = output_dir / split / "masks"
@@ -109,6 +116,7 @@ def save_split(
                 start=0,
                 end=length,
                 save_flare=save_flare,
+                progress_every=progress_every,
             )
         ]
     else:
@@ -124,6 +132,7 @@ def save_split(
                         "start": start,
                         "end": end,
                         "save_flare": save_flare,
+                        "progress_every": progress_every,
                     },
                 )
                 for start, end in ranges
@@ -148,6 +157,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--save-flare", action="store_true")
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--progress-every", type=int, default=500)
     parser.add_argument("--mask-absolute-threshold", type=float, default=0.018)
     parser.add_argument("--mask-relative-threshold", type=float, default=0.035)
     parser.add_argument("--mask-dilation", type=int, default=5)
@@ -198,6 +208,7 @@ def main():
         dataset_kwargs=train_kwargs,
         save_flare=args.save_flare,
         num_workers=args.num_workers,
+        progress_every=args.progress_every,
     )
     save_split(
         split="validation",
@@ -205,6 +216,7 @@ def main():
         dataset_kwargs=val_kwargs,
         save_flare=args.save_flare,
         num_workers=args.num_workers,
+        progress_every=args.progress_every,
     )
     print(f"saved dataset to {output_dir}")
 

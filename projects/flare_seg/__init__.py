@@ -1,0 +1,2 @@
+"""Flare segmentation project package."""
+

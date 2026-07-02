@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+from PIL import Image, ImageDraw
+
+from projects.flare_seg.dataset import FlareSegSyntheticDataset
+from projects.flare_seg.losses import DiceBCELoss
+
+
+class FlareSegProjectTest(unittest.TestCase):
+    def test_synthetic_dataset_returns_training_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            flickr = root / "flickr"
+            flare = root / "flare"
+            flickr.mkdir()
+            flare.mkdir()
+
+            Image.new("RGB", (160, 120), (80, 120, 160)).save(flickr / "base.jpg")
+            flare_img = Image.new("RGB", (128, 128), (0, 0, 0))
+            draw = ImageDraw.Draw(flare_img)
+            draw.ellipse((50, 50, 78, 78), fill=(255, 240, 180))
+            draw.line((10, 64, 118, 64), fill=(120, 90, 220), width=5)
+            flare_img.save(flare / "flare.png")
+
+            dataset = FlareSegSyntheticDataset(
+                flickr_path=str(flickr),
+                flare7kpp_path=str(flare),
+                length=1,
+                image_size=96,
+                deterministic=True,
+            )
+            item = dataset[0]
+
+            self.assertEqual(tuple(item["image"].shape), (3, 96, 96))
+            self.assertEqual(tuple(item["mask"].shape), (1, 96, 96))
+            self.assertGreater(float(item["mask"].max()), 0.0)
+            self.assertLess(float(item["mask"].mean()), 1.0)
+
+    def test_dice_bce_loss_handles_matching_logits_and_mask(self):
+        loss_fn = DiceBCELoss()
+        result = loss_fn(
+            logits=torch.zeros(2, 1, 96, 96),
+            target=torch.ones(2, 1, 96, 96),
+        )
+
+        self.assertIn("loss", result)
+        self.assertIn("iou_0.5", result)
+        self.assertTrue(torch.is_tensor(result["loss"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
+

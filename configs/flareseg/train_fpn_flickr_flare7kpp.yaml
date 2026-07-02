@@ -1,0 +1,118 @@
+experiment:
+  output_dir: outputs/flareseg_fpn
+
+runtime:
+  device: cuda
+  mixed_precision: bf16
+  distributed:
+    strategy: none
+
+data:
+  train:
+    dataset:
+      target: projects.flare_seg.dataset.FlareSegSyntheticDataset
+      params:
+        flickr_path: /content/drive/MyDrive/dataset/Flickr24K.zip
+        flare7kpp_path: /content/drive/MyDrive/dataset/Flare7K++.zip
+        length: 24000
+        image_size: 384
+        seed: 3407
+        deterministic: false
+        normalize: false
+        mask_absolute_threshold: 0.018
+        mask_relative_threshold: 0.035
+        mask_dilation: 5
+    dataloader:
+      batch_size: 4
+      shuffle: true
+      num_workers: 4
+      drop_last: true
+
+components:
+  segmenter:
+    target: models.fpn.FPNAdvance_f4
+    params:
+      num_classes: 1
+      pretrained: false
+    train:
+      strategy: full
+    mode: train
+    save: full
+
+optimizers:
+  main:
+    type: adamw
+    lr: 0.0002
+    weight_decay: 0.01
+    params:
+      include:
+        - segmenter.trainable
+
+schedulers:
+  main:
+    type: cosine
+    optimizer: main
+    total_steps: 100000
+    warmup_steps: 1000
+
+losses:
+  seg:
+    target: projects.flare_seg.losses.DiceBCELoss
+    weight: 1.0
+    params:
+      bce_weight: 1.0
+      dice_weight: 1.0
+    inputs:
+      logits: pred.logits
+      target: batch.mask
+
+train:
+  max_steps: 100000
+  max_epochs: 1000000
+  log_every: 20
+
+checkpoint:
+  save_every_steps: 1000
+  keep_last: 3
+  save_optimizer: true
+  save_scheduler: true
+
+logging:
+  reduce_metrics: true
+  tensorboard:
+    enabled: true
+  images:
+    enabled: true
+    every_n_steps: 100
+    max_images: 4
+    items:
+      - tag: flare/input
+        key: batch.viz_image
+        value_range: 0_1
+      - tag: flare/mask
+        key: batch.mask
+        value_range: 0_1
+
+train_program:
+  phases:
+    - name: flareseg
+      trainable:
+        - segmenter
+      zero_grad:
+        - main
+      ops:
+        forward_segmenter:
+          component: segmenter
+          inputs:
+            x: batch.image
+          outputs:
+            _: pred.logits
+      losses:
+        - seg
+      backward: true
+      clip_grad:
+        max_norm: 1.0
+      step:
+        - main
+      schedulers:
+        - main
